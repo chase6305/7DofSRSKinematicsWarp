@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "srs-kinematics-warp"
+version = "0.1.0"
+description = "Analytical FK/IK solver for SRS 7-DOF manipulators with Warp acceleration"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "SRS Kinematics Contributors" }]
+dependencies = [
+    "numpy>=1.24",
+    "torch>=2.1",
+    "warp-lang>=1.5",
+    "coloredlogs>=15.0",
+]
+
+[project.optional-dependencies]
+viewer = [
+    "viser==1.0.24",
+    "yourdfpy==0.0.58",
+]
+dev = [
+    "pytest>=8.0",
+    "ipython>=8.0",
+]
+
+[project.scripts]
+srs-viewer = "viser_viewer:main"
+srs-demo = "example.demo:main"
+
+[tool.setuptools]
+py-modules = ["srs_solver", "warp_kernel", "viser_viewer"]
+
+[tool.setuptools.packages.find]
+include = ["example*"]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+python_files = ["test_*.py"]
