@@ -1,5 +1,6 @@
-import torch
 import numpy as np
+import torch
+
 from srs_solver import SRSSolver, SRSSolverCfg
 
 
@@ -23,7 +24,7 @@ def test_srs_solver_ik():
     cfg.num_samples = 120
     cfg.sort_ik = True
     cfg.ik_nearest_weight = [1, 1, 1, 1, 1, 1, 1]
-    cfg.joint_names = [f"joint_{i+1}" for i in range(7)]
+    cfg.joint_names = [f"joint_{i + 1}" for i in range(7)]
     cfg.urdf_path = "./urdf/lbr_iiwa7_r800.urdf"
 
     # 创建 solver

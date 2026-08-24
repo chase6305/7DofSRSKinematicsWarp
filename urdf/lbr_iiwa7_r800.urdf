@@ -15,9 +15,6 @@
       <geometry> 
         <mesh filename="meshes/base_link.dae"/> 
       </geometry>  
-      <material name=""> 
-        <color rgba="0.647058823529412 0.619607843137255 0.588235294117647 1"/> 
-      </material> 
     </visual>  
     <collision> 
       <origin xyz="0 0 0" rpy="0 0 0"/>  
@@ -37,9 +34,6 @@
       <geometry> 
         <mesh filename="meshes/link1.dae"/> 
       </geometry>  
-      <material name=""> 
-        <color rgba="0.647058823529412 0.619607843137255 0.588235294117647 1"/> 
-      </material> 
     </visual>  
     <collision> 
       <origin xyz="0 0 0" rpy="0 0 0"/>  
@@ -66,9 +60,6 @@
       <geometry> 
         <mesh filename="meshes/link2.dae"/> 
       </geometry>  
-      <material name=""> 
-        <color rgba="0.647058823529412 0.619607843137255 0.588235294117647 1"/> 
-      </material> 
     </visual>  
     <collision> 
       <origin xyz="0 0 0" rpy="0 0 0"/>  
@@ -95,9 +86,6 @@
       <geometry> 
         <mesh filename="meshes/link3.dae"/> 
       </geometry>  
-      <material name=""> 
-        <color rgba="0.647058823529412 0.619607843137255 0.588235294117647 1"/> 
-      </material> 
     </visual>  
     <collision> 
       <origin xyz="0 0 0" rpy="0 0 0"/>  
@@ -124,9 +112,6 @@
       <geometry> 
         <mesh filename="meshes/link4.dae"/> 
       </geometry>  
-      <material name=""> 
-        <color rgba="0.647058823529412 0.619607843137255 0.588235294117647 1"/> 
-      </material> 
     </visual>  
     <collision> 
       <origin xyz="0 0 0" rpy="0 0 0"/>  
@@ -153,9 +138,6 @@
       <geometry> 
         <mesh filename="meshes/link5.dae"/> 
       </geometry>  
-      <material name=""> 
-        <color rgba="0.647058823529412 0.619607843137255 0.588235294117647 1"/> 
-      </material> 
     </visual>  
     <collision> 
       <origin xyz="0 0 0" rpy="0 0 0"/>  
@@ -182,9 +164,6 @@
       <geometry> 
         <mesh filename="meshes/link6.dae"/> 
       </geometry>  
-      <material name=""> 
-        <color rgba="0.647058823529412 0.619607843137255 0.588235294117647 1"/> 
-      </material> 
     </visual>  
     <collision> 
       <origin xyz="0 0 0" rpy="0 0 0"/>  
@@ -211,9 +190,6 @@
       <geometry> 
         <mesh filename="meshes/link7.dae"/> 
       </geometry>  
-      <material name=""> 
-        <color rgba="0.647058823529412 0.619607843137255 0.588235294117647 1"/> 
-      </material> 
     </visual>  
     <collision> 
       <origin xyz="0 0 0" rpy="0 0 0"/>  

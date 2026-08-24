@@ -26,7 +26,7 @@ def identity_mat33() -> wp.mat33:
 
 @wp.func
 def safe_acos(x: float) -> float:
-    return wp.acos(wp.clamp(x, -0.999999, 0.999999))
+    return wp.acos(wp.clamp(x, -1.0, 1.0))
 
 
 @wp.func
@@ -144,7 +144,6 @@ def calculate_arm_joint_angles(
         joints (wp.array): Output joint angles.
         tid (int): Thread index.
     """
-    d_bs = link_lengths[0]
     d_se = link_lengths[1]
     d_ew = link_lengths[2]
 
@@ -157,7 +156,11 @@ def calculate_arm_joint_angles(
     joints_val = wp.vec4()
 
     # Check reachability
-    if shoulder_to_wrist_length < wp.abs(d_bs + d_ew):
+    if (
+        shoulder_to_wrist_length > d_se + d_ew + 1.0e-6
+        or shoulder_to_wrist_length < wp.abs(d_se - d_ew) - 1.0e-6
+        or shoulder_to_wrist_length < 1.0e-8
+    ):
         res[tid] = 0
         joints[tid] = joints_val
         return
@@ -166,7 +169,7 @@ def calculate_arm_joint_angles(
     elbow_cos_angle = (
         wp.pow(shoulder_to_wrist_length, 2.0) - wp.pow(d_se, 2.0) - wp.pow(d_ew, 2.0)
     ) / (2.0 * d_se * d_ew)
-    if wp.abs(elbow_cos_angle) > 1.0:
+    if wp.abs(elbow_cos_angle) > 1.0 + 1.0e-6:
         res[tid] = 0
         joints[tid] = joints_val
         return
@@ -174,7 +177,7 @@ def calculate_arm_joint_angles(
     joints_val[3] = elbow_GC4 * safe_acos(elbow_cos_angle)
 
     # Compute shoulder angle
-    joints_val[0] = wp.atan2(y, x) if wp.abs(z) > 1e-6 else 0.0
+    joints_val[0] = wp.atan2(y, x) if horizontal_distance > 1.0e-10 else 0.0
 
     # Compute joint 2 angle
     angle_phi = safe_acos(
@@ -312,7 +315,7 @@ def compute_fk_kernel(
         a = dh_params[base_idx + 2]
         theta = dh_params[base_idx + 3]
         theta += joint_angles[tid * num_joints + i] * rotation_directions[i]
-        T = dh_transform(d, alpha, d, theta)
+        T = dh_transform(d, alpha, a, theta)
         pose = pose @ T
 
     # Apply additional transforms: base, end-effector, TCP
@@ -410,7 +413,6 @@ def validate_fk_with_target(
 # TODO: automatic gradient support
 @wp.kernel
 def compute_ik_kernel(
-    combinations: wp.array(dtype=wp.vec3),
     target_xpos_list: wp.array(dtype=wp.mat44),
     angles_list: wp.array(dtype=float),
     qpos_limits: wp.array(dtype=wp.vec2),
@@ -418,12 +420,6 @@ def compute_ik_kernel(
     dh_params: wp.array(dtype=float),
     link_lengths: wp.array(dtype=float),
     rotation_directions: wp.array(dtype=float),
-    res_arm_angles: wp.array(dtype=int),
-    joints_arm: wp.array(dtype=wp.vec4),
-    res_plane_normal: wp.array(dtype=int),
-    plane_normal: wp.array(dtype=wp.vec3),
-    base_to_elbow_rotation: wp.array(dtype=wp.mat33),
-    joints_plane: wp.array(dtype=wp.vec4),
     success: wp.array(dtype=int),
     qpos_out: wp.array(dtype=float),
 ):
@@ -431,8 +427,6 @@ def compute_ik_kernel(
     Compute inverse kinematics (IK) in parallel for multiple target poses.
 
     Args:
-        combinations (wp.array): Array of combinations, where each entry specifies
-            the indices of the target pose, configuration, and reference angle.
         target_xpos_list (wp.array): Array of target poses (4x4 transformation matrices).
         angles_list (wp.array): Array of reference angles for IK computation.
         qpos_limits (wp.array): Array of joint position limits (min, max) for each joint.
@@ -440,12 +434,6 @@ def compute_ik_kernel(
         dh_params (wp.array): Denavit-Hartenberg parameters for the robot.
         link_lengths (wp.array): Array of link lengths for the robot arm.
         rotation_directions (wp.array): Array of rotation direction multipliers for each joint.
-        res_arm_angles (wp.array): Output array for arm joint angle computation results.
-        joints_arm (wp.array): Output array for computed arm joint angles.
-        res_plane_normal (wp.array): Output array for plane normal computation results.
-        plane_normal (wp.array): Output array for computed plane normal vectors.
-        base_to_elbow_rotation (wp.array): Output array for base-to-elbow rotation matrices.
-        joints_plane (wp.array): Output array for computed joint angles in the plane.
         success (wp.array): Output array indicating whether IK computation was successful.
         qpos_out (wp.array): Output array for computed joint positions.
 
@@ -457,9 +445,13 @@ def compute_ik_kernel(
     tid = wp.tid()  # Thread ID (for batch processing, if needed)
 
     # Extract indices
-    target_idx = int(combinations[tid][0])
-    config_idx = int(combinations[tid][1])
-    angle_idx = int(combinations[tid][2])
+    num_angles = angles_list.shape[0]
+    num_configs = configs.shape[0]
+    solutions_per_target = num_configs * num_angles
+    target_idx = tid // solutions_per_target
+    local_idx = tid - target_idx * solutions_per_target
+    config_idx = local_idx // num_angles
+    angle_idx = local_idx - config_idx * num_angles
 
     # Load inputs
     target_xpos = target_xpos_list[target_idx]
@@ -481,25 +473,68 @@ def compute_ik_kernel(
 
     # Compute shoulder-to-wrist vector
     P02 = wp.vec3(0.0, 0.0, link_lengths[0])
-    P67 = wp.vec3(0.0, 0.0, dh_params[12])
+    P67 = wp.vec3(0.0, 0.0, dh_params[6 * 4 + 0])
     P06 = P_target - R_target @ P67
     P26 = P06 - P02
 
-    calculate_arm_joint_angles(
-        P26, elbow_config, link_lengths, res_arm_angles, joints_arm, tid
-    )
-    if res_arm_angles[tid] == 0:
+    # Reference-plane geometry is kept thread-local. Older versions wrote
+    # four large temporary arrays, which dominated memory for large batches.
+    shoulder_to_wrist_length = wp.length(P26)
+    d_se = link_lengths[1]
+    d_ew = link_lengths[2]
+    if (
+        shoulder_to_wrist_length > d_se + d_ew + 1.0e-6
+        or shoulder_to_wrist_length < wp.abs(d_se - d_ew) - 1.0e-6
+        or shoulder_to_wrist_length < 1.0e-8
+    ):
         success[tid] = 0
         return
-    joints_v = joints_arm[tid]
+    elbow_cos = (
+        shoulder_to_wrist_length * shoulder_to_wrist_length - d_se * d_se - d_ew * d_ew
+    ) / (2.0 * d_se * d_ew)
+    if wp.abs(elbow_cos) > 1.0 + 1.0e-6:
+        success[tid] = 0
+        return
+    q4 = elbow_config * safe_acos(elbow_cos)
+    horizontal = wp.length(wp.vec2(P26.x, P26.y))
+    ref_q1 = wp.atan2(P26.y, P26.x) if horizontal > 1.0e-10 else 0.0
+    phi = safe_acos(
+        (
+            d_se * d_se
+            + shoulder_to_wrist_length * shoulder_to_wrist_length
+            - d_ew * d_ew
+        )
+        / (2.0 * d_se * shoulder_to_wrist_length)
+    )
+    ref_q2 = wp.atan2(horizontal, P26.z) + elbow_config * phi
+    R03_o = identity_mat33()
+    for joint_index in range(3):
+        ref_angle = 0.0
+        if joint_index == 0:
+            ref_angle = ref_q1
+        elif joint_index == 1:
+            ref_angle = ref_q2
+        transform = dh_transform(
+            dh_params[joint_index * 4 + 0],
+            dh_params[joint_index * 4 + 1],
+            dh_params[joint_index * 4 + 2],
+            ref_angle,
+        )
+        R03_o = R03_o @ wp.mat33(
+            transform[0, 0],
+            transform[0, 1],
+            transform[0, 2],
+            transform[1, 0],
+            transform[1, 1],
+            transform[1, 2],
+            transform[2, 0],
+            transform[2, 1],
+            transform[2, 2],
+        )
 
     # fmt: off
-    # Calculate transformations
     T34 = dh_transform(
-        dh_params[12],
-        dh_params[13],
-        dh_params[14],
-        joints_v[3],
+        dh_params[12], dh_params[13], dh_params[14], q4
     )
     R34 = wp.mat33(
         T34[0, 0], T34[0, 1], T34[0, 2],
@@ -507,24 +542,6 @@ def compute_ik_kernel(
         T34[2, 0], T34[2, 1], T34[2, 2],
     )
     # fmt: on
-
-    # Calculate reference joint angles
-    compute_reference_plane(
-        target_xpos,
-        elbow_config,
-        link_lengths,
-        dh_params,
-        res_plane_normal,
-        plane_normal,
-        base_to_elbow_rotation,
-        joints_plane,
-        tid,
-    )
-    if res_plane_normal[tid] == 0:
-        success[tid] = 0
-        return
-
-    R03_o = base_to_elbow_rotation[tid]
 
     usw = wp.normalize(P26)
     skew_usw = skew(usw)
@@ -552,7 +569,6 @@ def compute_ik_kernel(
     Cw = wp.transpose(R34) @ wp.transpose(Cs) @ R_target
     R47 = Aw * s_psi + Bw * c_psi + Cw
 
-    q4 = joints_v[3]
     # TODO: judgment wrist singularity
     q5 = wp.atan2(R47[1, 2] * wrist_config, R47[0, 2] * wrist_config)
     q6 = safe_acos(R47[2, 2]) * wrist_config
