@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-
+from srs_solver import get_iiwa_urdf_path
 from viser_viewer import SingleArmViserViewer
 
 if TYPE_CHECKING:
@@ -62,9 +62,7 @@ def build_solver_cfg() -> SRSSolverCfg:
     cfg.sort_ik = True
     cfg.ik_nearest_weight = [1, 1, 1, 1, 1, 1, 1]
     cfg.joint_names = [f"joint{i + 1}" for i in range(7)]
-    cfg.urdf_path = str(
-        Path(__file__).resolve().parent.parent / "urdf" / "lbr_iiwa7_r800.urdf"
-    )
+    cfg.urdf_path = get_iiwa_urdf_path()
     return cfg
 
 
@@ -201,7 +199,7 @@ def run_ab_pose_interp_ik_sim(host: str, port: int, steps: int, dt: float) -> No
     print("Reachable B ratio under fixed orientation:", f"{reachable_alpha:.3f}")
 
     viewer = SingleArmViserViewer(
-        Path(__file__).resolve().parent.parent / "urdf" / "lbr_iiwa7_r800.urdf",
+        Path(get_iiwa_urdf_path()),
         host=host,
         port=port,
     )

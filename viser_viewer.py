@@ -11,7 +11,7 @@ Dependencies:
 - yourdfpy==0.0.58
 
 Run:
-	python viser_viewer.py
+        python viser_viewer.py
 """
 
 from __future__ import annotations
@@ -93,13 +93,15 @@ class SingleArmViserViewer:
 
 
 def _parse_args() -> argparse.Namespace:
+    from srs_solver import get_iiwa_urdf_path
+
     parser = argparse.ArgumentParser(
         description="Standalone Viser viewer for a single 7-DOF arm."
     )
     parser.add_argument(
         "--urdf",
         type=Path,
-        default=Path(__file__).parent / "urdf" / "lbr_iiwa7_r800.urdf",
+        default=Path(get_iiwa_urdf_path()),
         help="Path to the robot URDF.",
     )
     parser.add_argument(

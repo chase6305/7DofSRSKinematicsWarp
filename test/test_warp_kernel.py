@@ -1,6 +1,5 @@
 import numpy as np
 import warp as wp
-
 from warp_kernel import compute_fk_kernel, compute_ik_kernel
 
 
@@ -95,6 +94,8 @@ def test_warp_parallel_ik_round_trip_on_cpu(tmp_path):
             wp.array(configs, dtype=wp.vec3, device="cpu"),
             wp.array(dh.ravel(), dtype=float, device="cpu"),
             wp.array([0.34, 0.4, 0.4, 0.126], dtype=float, device="cpu"),
+            wp.array(np.ones(7, dtype=np.float32), dtype=float, device="cpu"),
+            wp.zeros(7, dtype=float, device="cpu"),
             wp.array(np.ones(7, dtype=np.float32), dtype=float, device="cpu"),
         ],
         outputs=[success, qpos],

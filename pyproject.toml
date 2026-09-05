@@ -20,6 +20,7 @@ dependencies = [
 viewer = [
     "viser==1.0.24",
     "yourdfpy==0.0.58",
+    "trimesh>=4.0",
 ]
 dev = [
     "pytest>=8.0",
@@ -31,12 +32,17 @@ srs-viewer = "viser_viewer:main"
 srs-demo = "example.demo:main"
 srs-parallel-demo = "example.parallel_demo:main"
 srs-null-space-demo = "example.parallel_null_space_demo:main"
+srs-warp-lab = "srs_warp_viser.app:main"
 
 [tool.setuptools]
 py-modules = ["srs_solver", "warp_kernel", "viser_viewer"]
+packages = ["example", "srs_kinematics_warp_assets", "srs_warp_viser"]
 
-[tool.setuptools.packages.find]
-include = ["example*"]
+[tool.setuptools.package-dir]
+srs_kinematics_warp_assets = "urdf"
+
+[tool.setuptools.package-data]
+srs_kinematics_warp_assets = ["*.urdf", "meshes/*.dae", "meshes/*.stl"]
 
 [tool.pytest.ini_options]
 testpaths = ["test"]

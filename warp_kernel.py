@@ -326,6 +326,128 @@ def compute_fk_kernel(
     success[tid] = 1
 
 
+@wp.kernel
+def compute_fk_chain_kernel(
+    joint_angles: wp.array(dtype=float),
+    dh_params: wp.array(dtype=float),
+    rotation_directions: wp.array(dtype=float),
+    base: wp.mat44,
+    tool: wp.mat44,
+    output: wp.array(dtype=wp.mat44),
+):
+    """Write seven world-frame DH link poses and the TCP in one traversal."""
+    tid = wp.tid()
+    pose = base
+    for joint in range(7):
+        offset = joint * 4
+        theta = (
+            dh_params[offset + 3]
+            + joint_angles[tid * 7 + joint] * rotation_directions[joint]
+        )
+        pose = pose @ dh_transform(
+            dh_params[offset], dh_params[offset + 1], dh_params[offset + 2], theta
+        )
+        output[tid * 8 + joint] = pose
+    output[tid * 8 + 7] = pose @ tool
+
+
+mat73 = wp.types.matrix(shape=(7, 3), dtype=wp.float32)
+
+
+@wp.kernel
+def compute_jacobian_kernel(
+    joint_angles: wp.array(dtype=float),
+    dh_params: wp.array(dtype=float),
+    rotation_directions: wp.array(dtype=float),
+    base: wp.mat44,
+    tool: wp.mat44,
+    output: wp.array(dtype=float),
+):
+    """One thread per robot; store joint axes during a single FK traversal."""
+    tid = wp.tid()
+    pose = base
+    origins = mat73()
+    axes = mat73()
+    for joint in range(7):
+        for component in range(3):
+            origins[joint, component] = pose[component, 3]
+            axes[joint, component] = pose[component, 2] * rotation_directions[joint]
+        offset = joint * 4
+        pose = pose @ dh_transform(
+            dh_params[offset],
+            dh_params[offset + 1],
+            dh_params[offset + 2],
+            dh_params[offset + 3]
+            + joint_angles[tid * 7 + joint] * rotation_directions[joint],
+        )
+    pose = pose @ tool
+    tcp = wp.vec3(pose[0, 3], pose[1, 3], pose[2, 3])
+    for joint in range(7):
+        origin = wp.vec3(origins[joint, 0], origins[joint, 1], origins[joint, 2])
+        axis = wp.vec3(axes[joint, 0], axes[joint, 1], axes[joint, 2])
+        linear = wp.cross(axis, tcp - origin)
+        for component in range(3):
+            output[tid * 42 + component * 7 + joint] = linear[component]
+            output[tid * 42 + (component + 3) * 7 + joint] = axis[component]
+
+
+@wp.func
+def periodic_joint(value: float, lower: float, upper: float, seed: float) -> wp.vec2:
+    period = 2.0 * wp.pi
+    minimum = wp.ceil((lower - value - 1.0e-6) / period)
+    maximum = wp.floor((upper - value + 1.0e-6) / period)
+    if minimum > maximum:
+        return wp.vec2(0.0, 0.0)
+    turns = wp.clamp(wp.floor((seed - value) / period + 0.5), minimum, maximum)
+    return wp.vec2(wp.clamp(value + turns * period, lower, upper), 1.0)
+
+
+@wp.func
+def coupled_joints(
+    coupled: float,
+    sign: float,
+    alo: float,
+    ahi: float,
+    blo: float,
+    bhi: float,
+    aseed: float,
+    bseed: float,
+    aw: float,
+    bw: float,
+) -> wp.vec3:
+    """Weighted projection onto x + sign*y = coupled mod 2pi and box limits."""
+    ylo = wp.min(sign * blo, sign * bhi)
+    yhi = wp.max(sign * blo, sign * bhi)
+    period = 2.0 * wp.pi
+    kmin = wp.ceil((alo + ylo - coupled - 1.0e-6) / period)
+    kmax = wp.floor((ahi + yhi - coupled + 1.0e-6) / period)
+    if kmin > kmax:
+        return wp.vec3(0.0, 0.0, 0.0)
+    closest = wp.clamp(aseed, alo, ahi) + wp.clamp(sign * bseed, ylo, yhi)
+    k = wp.floor((closest - coupled) / period)
+    scale = wp.max(aw, bw)
+    wa = float(1.0)
+    wb = float(1.0)
+    if scale > 0.0:
+        wa = (aw / scale) * (aw / scale)
+        wb = (bw / scale) * (bw / scale)
+    best_cost = float(1.0e30)
+    best = wp.vec3(0.0, 0.0, 0.0)
+    for offset in range(2):
+        total = coupled + period * wp.clamp(k + float(offset), kmin, kmax)
+        lower = wp.max(alo, total - yhi)
+        upper = wp.min(ahi, total - ylo)
+        x = wp.clamp(
+            (wa * aseed + wb * (total - sign * bseed)) / (wa + wb), lower, upper
+        )
+        y = sign * (total - x)
+        cost = wa * (x - aseed) * (x - aseed) + wb * (y - bseed) * (y - bseed)
+        if offset == 0 or cost < best_cost:
+            best_cost = cost
+            best = wp.vec3(x, y, 1.0)
+    return best
+
+
 @wp.func
 def frobenius_norm(mat: wp.mat44) -> float:
     """
@@ -420,6 +542,8 @@ def compute_ik_kernel(
     dh_params: wp.array(dtype=float),
     link_lengths: wp.array(dtype=float),
     rotation_directions: wp.array(dtype=float),
+    joint_seeds: wp.array(dtype=float),
+    nearest_weights: wp.array(dtype=float),
     success: wp.array(dtype=int),
     qpos_out: wp.array(dtype=float),
 ):
@@ -552,15 +676,10 @@ def compute_ik_kernel(
     As = skew_usw @ R03_o
     Bs = -skew_usw @ skew_usw @ R03_o
     Cs = wp.outer(usw, usw) @ R03_o
-    R03 = (
-        (skew_usw @ R03_o) * s_psi
-        + (-skew_usw @ skew_usw @ R03_o) * c_psi
-        + (wp.outer(usw, usw) @ R03_o)
-    )
+    R03 = As * s_psi + Bs * c_psi + Cs
 
-    # TODO: judgment shoulder singularity
     q1 = wp.atan2(R03[1, 1] * shoulder_config, R03[0, 1] * shoulder_config)
-    q2 = safe_acos(R03[2, 1]) * shoulder_config
+    q2 = wp.atan2(wp.length(wp.vec2(R03[0, 1], R03[1, 1])), R03[2, 1]) * shoulder_config
     q3 = wp.atan2(-R03[2, 2] * shoulder_config, -R03[2, 0] * shoulder_config)
 
     # Calculate wrist joint angles (q5, q6, q7)
@@ -569,12 +688,9 @@ def compute_ik_kernel(
     Cw = wp.transpose(R34) @ wp.transpose(Cs) @ R_target
     R47 = Aw * s_psi + Bw * c_psi + Cw
 
-    # TODO: judgment wrist singularity
     q5 = wp.atan2(R47[1, 2] * wrist_config, R47[0, 2] * wrist_config)
-    q6 = safe_acos(R47[2, 2]) * wrist_config
+    q6 = wp.atan2(wp.length(wp.vec2(R47[0, 2], R47[1, 2])), R47[2, 2]) * wrist_config
     q7 = wp.atan2(R47[2, 1] * wrist_config, -R47[2, 0] * wrist_config)
-
-    out_of_limits = int(0)
 
     q1_val = (q1 - dh_params[3]) * rotation_directions[0]
     q2_val = (q2 - dh_params[7]) * rotation_directions[1]
@@ -584,33 +700,141 @@ def compute_ik_kernel(
     q6_val = (q6 - dh_params[23]) * rotation_directions[5]
     q7_val = (q7 - dh_params[27]) * rotation_directions[6]
 
-    out_of_limits = int(0)
-    out_of_limits = out_of_limits | (
-        1 if (q1_val < qpos_limits[0][0] or q1_val > qpos_limits[0][1]) else 0
-    )
-    out_of_limits = out_of_limits | (
-        1 if (q2_val < qpos_limits[1][0] or q2_val > qpos_limits[1][1]) else 0
-    )
-    out_of_limits = out_of_limits | (
-        1 if (q3_val < qpos_limits[2][0] or q3_val > qpos_limits[2][1]) else 0
-    )
-    out_of_limits = out_of_limits | (
-        1 if (q4_val < qpos_limits[3][0] or q4_val > qpos_limits[3][1]) else 0
-    )
-    out_of_limits = out_of_limits | (
-        1 if (q5_val < qpos_limits[4][0] or q5_val > qpos_limits[4][1]) else 0
-    )
-    out_of_limits = out_of_limits | (
-        1 if (q6_val < qpos_limits[5][0] or q6_val > qpos_limits[5][1]) else 0
-    )
-    out_of_limits = out_of_limits | (
-        1 if (q7_val < qpos_limits[6][0] or q7_val > qpos_limits[6][1]) else 0
-    )
+    if wp.abs(wp.sin(q2)) < 1.0e-6:
+        r1 = dh_transform(dh_params[0], dh_params[1], dh_params[2], 0.0)
+        r2 = dh_transform(dh_params[4], dh_params[5], dh_params[6], q2)
+        prior = r1 @ r2
+        rotation = wp.mat33(
+            prior[0, 0],
+            prior[0, 1],
+            prior[0, 2],
+            prior[1, 0],
+            prior[1, 1],
+            prior[1, 2],
+            prior[2, 0],
+            prior[2, 1],
+            prior[2, 2],
+        )
+        residual = wp.transpose(rotation) @ R03
+        sign = float(1.0)
+        if wp.cos(q2) < 0.0:
+            sign = -1.0
+        total = (
+            sign * wp.atan2(residual[1, 0], residual[0, 0])
+            - dh_params[3]
+            - sign * dh_params[11]
+        ) * rotation_directions[0]
+        native_sign = sign * rotation_directions[0] * rotation_directions[2]
+        pair = coupled_joints(
+            total,
+            native_sign,
+            qpos_limits[0][0],
+            qpos_limits[0][1],
+            qpos_limits[2][0],
+            qpos_limits[2][1],
+            joint_seeds[target_idx * 7 + 0],
+            joint_seeds[target_idx * 7 + 2],
+            nearest_weights[0],
+            nearest_weights[2],
+        )
+        if pair[2] == 0.0:
+            success[tid] = 0
+            return
+        q1_val = pair[0]
+        q3_val = pair[1]
 
-    # Check joint limits
-    if out_of_limits == 1:
+    if wp.abs(wp.sin(q6)) < 1.0e-6:
+        r1 = dh_transform(dh_params[16], dh_params[17], dh_params[18], 0.0)
+        r2 = dh_transform(dh_params[20], dh_params[21], dh_params[22], q6)
+        prior = r1 @ r2
+        rotation = wp.mat33(
+            prior[0, 0],
+            prior[0, 1],
+            prior[0, 2],
+            prior[1, 0],
+            prior[1, 1],
+            prior[1, 2],
+            prior[2, 0],
+            prior[2, 1],
+            prior[2, 2],
+        )
+        residual = wp.transpose(rotation) @ R47
+        sign = float(1.0)
+        if wp.cos(q6) < 0.0:
+            sign = -1.0
+        total = (
+            sign * wp.atan2(residual[1, 0], residual[0, 0])
+            - dh_params[19]
+            - sign * dh_params[27]
+        ) * rotation_directions[4]
+        native_sign = sign * rotation_directions[4] * rotation_directions[6]
+        pair = coupled_joints(
+            total,
+            native_sign,
+            qpos_limits[4][0],
+            qpos_limits[4][1],
+            qpos_limits[6][0],
+            qpos_limits[6][1],
+            joint_seeds[target_idx * 7 + 4],
+            joint_seeds[target_idx * 7 + 6],
+            nearest_weights[4],
+            nearest_weights[6],
+        )
+        if pair[2] == 0.0:
+            success[tid] = 0
+            return
+        q5_val = pair[0]
+        q7_val = pair[1]
+
+    mapped = periodic_joint(
+        q1_val, qpos_limits[0][0], qpos_limits[0][1], joint_seeds[target_idx * 7 + 0]
+    )
+    if mapped[1] == 0.0:
         success[tid] = 0
         return
+    q1_val = mapped[0]
+    mapped = periodic_joint(
+        q2_val, qpos_limits[1][0], qpos_limits[1][1], joint_seeds[target_idx * 7 + 1]
+    )
+    if mapped[1] == 0.0:
+        success[tid] = 0
+        return
+    q2_val = mapped[0]
+    mapped = periodic_joint(
+        q3_val, qpos_limits[2][0], qpos_limits[2][1], joint_seeds[target_idx * 7 + 2]
+    )
+    if mapped[1] == 0.0:
+        success[tid] = 0
+        return
+    q3_val = mapped[0]
+    mapped = periodic_joint(
+        q4_val, qpos_limits[3][0], qpos_limits[3][1], joint_seeds[target_idx * 7 + 3]
+    )
+    if mapped[1] == 0.0:
+        success[tid] = 0
+        return
+    q4_val = mapped[0]
+    mapped = periodic_joint(
+        q5_val, qpos_limits[4][0], qpos_limits[4][1], joint_seeds[target_idx * 7 + 4]
+    )
+    if mapped[1] == 0.0:
+        success[tid] = 0
+        return
+    q5_val = mapped[0]
+    mapped = periodic_joint(
+        q6_val, qpos_limits[5][0], qpos_limits[5][1], joint_seeds[target_idx * 7 + 5]
+    )
+    if mapped[1] == 0.0:
+        success[tid] = 0
+        return
+    q6_val = mapped[0]
+    mapped = periodic_joint(
+        q7_val, qpos_limits[6][0], qpos_limits[6][1], joint_seeds[target_idx * 7 + 6]
+    )
+    if mapped[1] == 0.0:
+        success[tid] = 0
+        return
+    q7_val = mapped[0]
 
     is_valid = validate_fk_with_target(
         q1=q1_val,
