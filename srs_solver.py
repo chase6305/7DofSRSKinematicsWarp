@@ -703,6 +703,31 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
         rotation = np.linalg.norm(actual[..., :3, :3] - target[:3, :3], axis=(-2, -1))
         return (position <= 1e-4) & (rotation <= np.sqrt(8.0) * np.sin(5e-5))
 
+    def _configuration_candidates(self, local, angles, branches, seed):
+        """Decompose mixed branch/angle requests in their original input order."""
+        output = np.zeros((len(angles), 7))
+        success = np.zeros(len(angles), dtype=bool)
+        for elbow in (1, -1):
+            rows = np.flatnonzero((branches & 2) == (0 if elbow > 0 else 2))
+            if not len(rows):
+                continue
+            geometry = self._prepare_ik(local, elbow)
+            if geometry is None:
+                continue
+            candidates = (
+                self._candidate_joint_angles(
+                    geometry,
+                    angles[rows],
+                    branches[rows],
+                    seed * self.rotation_directions_np,
+                )
+                * self.rotation_directions_np
+            )
+            candidates, valid = self._map_to_limits(candidates, seed)
+            output[rows[valid]] = candidates[valid]
+            success[rows] = valid
+        return success, output
+
     def get_ik(
         self,
         target_xpos,
@@ -789,20 +814,11 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
                         continue
                 except (ValueError, FloatingPointError):
                     pass
-            blocks = []
-            for branch in range(8):
-                joints = (
-                    self._candidate_joint_angles(
-                        prepare(branch),
-                        self.elbow_angles,
-                        branch,
-                        seed * self.rotation_directions_np,
-                    )
-                    * self.rotation_directions_np
-                )
-                joints, valid = self._map_to_limits(joints, seed)
-                blocks.append(joints[valid])
-            candidates = np.concatenate(blocks)
+            branches = np.repeat(np.arange(8), len(self.elbow_angles))
+            valid, joints = self._configuration_candidates(
+                local_target, np.tile(self.elbow_angles, 8), branches, seed
+            )
+            candidates = joints[valid]
             if self.cfg.sort_ik:
                 distances = np.linalg.norm(
                     (candidates - seed) * self._distance_weights, axis=-1
@@ -1558,9 +1574,10 @@ class SRSSolver:
         configurations = tuple(configurations)
         if any(not isinstance(c, SRSConfiguration) for c in configurations):
             raise TypeError("configurations must contain SRSConfiguration values")
-        output = np.zeros((len(configurations), 7))
-        success = np.zeros(len(configurations), dtype=bool)
-        if configurations:
+        if not configurations:
+            output = np.zeros((0, 7))
+            success = np.zeros(0, dtype=bool)
+        else:
             branches = np.array(
                 [
                     int(c.shoulder < 0)
@@ -1572,25 +1589,9 @@ class SRSSolver:
             angles = np.array([c.redundancy for c in configurations])
             impl = self._geometry_impl
             local = impl._local_target(target)
-            for elbow in (1, -1):
-                rows = np.flatnonzero((branches & 2) == (0 if elbow > 0 else 2))
-                if not len(rows):
-                    continue
-                geometry = impl._prepare_ik(local, elbow)
-                if geometry is None:
-                    continue
-                candidates = (
-                    impl._candidate_joint_angles(
-                        geometry,
-                        angles[rows],
-                        branches[rows],
-                        seed * impl.rotation_directions_np,
-                    )
-                    * impl.rotation_directions_np
-                )
-                candidates, valid = impl._map_to_limits(candidates, seed)
-                output[rows[valid]] = candidates[valid]
-                success[rows] = valid
+            success, output = impl._configuration_candidates(
+                local, angles, branches, seed
+            )
             rows = np.flatnonzero(success)
             if len(rows):
                 actual = impl._get_fk(output[rows])
