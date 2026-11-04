@@ -55,3 +55,9 @@ iiwa 7 R800 geometry, URDF path and joint limits directly.
 - Joint weights must be finite and non-negative; rotation directions must be `-1` or `1`; sampling requires an integer of at least two. Pose inputs must be rigid homogeneous transforms. Explicit zero-width limits are retained.
 - Empty batches return empty outputs of the documented shapes. Importing the library does not configure application logging.
 - Wheels include the URDF and all visual/collision meshes; the solver, viewer and demo resolve installed resources outside the source checkout.
+
+Mixed shoulder/wrist requests in `solve_configurations` are decomposed together
+in at most two elbow groups. Output order, per-row validity, periodic mapping,
+seed-weighted singular solutions and live joint limits are preserved. This is
+a CPU geometry optimization in both repositories, including exact queries on
+a CUDA-configured Warp solver; global Warp kernels are unchanged.

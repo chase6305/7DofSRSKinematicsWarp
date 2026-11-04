@@ -54,3 +54,33 @@ calls with an unchanged batch size reuse the large Warp work buffers.
 │   └── meshes/
 └── pyproject.toml
 ```
+
+
+## Exact-configuration batch optimization
+
+Eight S/E/W branches share only two elbow geometries. Batch requests now
+decompose all matching shoulder/wrist rows together, reducing up to eight
+decomposition calls to two. Shuffled input order, zero/π shoulder and wrist
+singularities, periodic limits, seeds and reversed joints are covered by tests.
+
+A local CPU comparison against the previous implementation reused the same
+target, seed and configuration objects. Nine interleaved repeats of 30 warmed
+calls produced these medians; output masks and joint arrays were exactly equal:
+
+| Exact requests | Before | After | Speedup |
+|:--|--:|--:|--:|
+| Eight-branch gallery (8) | 0.344 ms | 0.153 ms | 2.25× |
+| Self-motion sampling (584) | 0.749 ms | 0.539 ms | 1.39× |
+
+These timings use Python 3.10 and NumPy 2.2.6, and exclude request construction,
+the viewer, and WebGL. Warp's exact-configuration API also uses CPU geometry;
+the figures do not measure GPU global IK throughput. Hardware and workload
+affect the timings.
+
+Run the companion benchmark from the checkout to measure scalar fixed/moving
+TCP queries, the eight-branch batch, and the 584-point manifold batch. The
+benchmark includes adapter/request construction and verifies TCP residuals:
+
+```bash
+python tools/benchmark_srs.py --backend warp --device cpu --frames 180 --repeats 15
+```

@@ -5,7 +5,9 @@
 NVIDIA Warp analytical kinematics for 7-DoF S-R-S arms, with a Torch batch API
 and CPU fallback.
 
-![Warp fixed-TCP self-motion captured from the running Viser app](docs/media/demo.gif)
+![Recorded fixed-TCP self-motion and figure-eight TCP tracking](docs/media/demo.gif)
+
+Fixed-TCP self-motion → figure-eight tracking. Ten seconds of actual Warp/CPU playback.
 
 - GPU batched FK / IK, analytical Jacobians and all eight S/E/W branches.
 - Cross-checked against NumPy, with the same bundled KUKA iiwa 7 R800 model.

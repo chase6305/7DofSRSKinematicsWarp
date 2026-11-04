@@ -14,9 +14,11 @@ BACKENDS = [(False, "cpu"), (True, "cpu")] + (
 
 
 @pytest.mark.parametrize("use_warp,device", BACKENDS)
-@pytest.mark.parametrize("middle", [None, 1, 5])
+@pytest.mark.parametrize(
+    "middle,value", [(None, 0), (1, 0), (5, 0), (1, np.pi), (5, np.pi)]
+)
 def test_configuration_batch_matches_scalar_with_reversed_joints_and_frames(
-    use_warp, device, middle, monkeypatch
+    use_warp, device, middle, value, monkeypatch
 ):
     cfg = SRSSolverCfg()
     cfg.rotation_directions = np.array([-1, 1, -1, 1, -1, 1, -1])
@@ -27,7 +29,9 @@ def test_configuration_batch_matches_scalar_with_reversed_joints_and_frames(
     solver = SRSSolver(cfg, 1, device, use_warp=use_warp)
     q = np.array([0.3, -0.5, 0.7, 1.0, -0.4, 0.8, -0.2])
     if middle is not None:
-        q[middle] = 0
+        q[middle] = value
+    if value:
+        solver.set_position_limits(np.full(7, -4.0), np.full(7, 4.0))
     target = solver._geometry_impl._get_fk(q)
     psi = solver.get_arm_angle(q)
     configs = [
@@ -35,17 +39,30 @@ def test_configuration_batch_matches_scalar_with_reversed_joints_and_frames(
         for delta in (0.2, 0, -0.2, 0)
         for branch in product((-1, 1), repeat=3)
     ]
+    configs = [configs[i] for i in np.random.default_rng(7).permutation(len(configs))]
     expected = [solver.solve_configuration(target, c, q) for c in configs]
     calls = []
     prepare = solver._geometry_impl._prepare_ik
+    decompose = solver._geometry_impl._candidate_joint_angles
+    decompositions = []
 
     def counted(local, elbow):
         calls.append(elbow)
         return prepare(local, elbow)
 
     monkeypatch.setattr(solver._geometry_impl, "_prepare_ik", counted)
+
+    def counted_decomposition(prepared, angles, branches, seed):
+        decompositions.append(np.asarray(branches).copy())
+        return decompose(prepared, angles, branches, seed)
+
+    monkeypatch.setattr(
+        solver._geometry_impl, "_candidate_joint_angles", counted_decomposition
+    )
     ok, joints = solver.solve_configurations(target, iter(configs), q)
     assert sorted(calls) == [-1, 1]
+    assert len(decompositions) == 2
+    assert all(len(np.unique(branches & 2)) == 1 for branches in decompositions)
     assert joints.device.type == device
     assert ok.dtype == torch.bool
     np.testing.assert_array_equal(ok.cpu(), [item[0] for item in expected])

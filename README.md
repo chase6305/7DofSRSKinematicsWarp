@@ -4,7 +4,9 @@
 
 基于 NVIDIA Warp 的 7 自由度 S-R-S 解析运动学，提供 Torch 批量接口与 CPU 回退。
 
-![Warp 后端固定 TCP 自运动：实际 Viser 运行画面](docs/media/demo.gif)
+![固定 TCP 自运动与 8 字轨迹跟踪实录](docs/media/demo.gif)
+
+固定 TCP 自运动 → 8 字轨迹跟踪，10 秒 Warp/CPU 实录。
 
 - GPU 批量 FK / IK、解析雅可比和八种肩肘腕分支。
 - 与 NumPy 参考实现交叉校验，内置一致的 KUKA iiwa 7 R800 模型。

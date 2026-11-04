@@ -491,9 +491,14 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
         return shoulder, wrist, joints[3]
 
     def _candidate_joint_angles(self, prepared, nsparams, rconf, joint_seed):
-        """Decompose one branch for a scalar or a vector of arm angles."""
+        """Decompose scalar requests or mixed branches sharing elbow geometry."""
         shoulder, wrist, elbow_angle = prepared
-        arm_config, _, wrist_config = self._configuration(rconf)
+        if isinstance(rconf, (int, np.integer)):
+            arm_config, _, wrist_config = self._configuration(rconf)
+        else:
+            rconf = np.asarray(rconf)
+            arm_config = np.where(rconf & 1, -1, 1)
+            wrist_config = np.where(rconf & 4, -1, 1)
         psi = np.asarray(nsparams)
         sine, cosine = np.sin(psi)[..., None, None], np.cos(psi)[..., None, None]
         r03 = shoulder[0] * sine + shoulder[1] * cosine + shoulder[2]
@@ -1490,19 +1495,18 @@ class SRSSolver:
             angles = np.array([c.redundancy for c in configurations])
             impl = self._geometry_impl
             local = impl._local_target(target)
-            geometry = {}
-            for branch in np.unique(branches):
-                elbow = impl._configuration(branch)[1]
-                if elbow not in geometry:
-                    geometry[elbow] = impl._prepare_ik(local, elbow)
-                if geometry[elbow] is None:
+            for elbow in (1, -1):
+                rows = np.flatnonzero((branches & 2) == (0 if elbow > 0 else 2))
+                if not len(rows):
                     continue
-                rows = np.flatnonzero(branches == branch)
+                geometry = impl._prepare_ik(local, elbow)
+                if geometry is None:
+                    continue
                 candidates = (
                     impl._candidate_joint_angles(
-                        geometry[elbow],
+                        geometry,
                         angles[rows],
-                        branch,
+                        branches[rows],
                         seed * impl.rotation_directions_np,
                     )
                     * impl.rotation_directions_np
