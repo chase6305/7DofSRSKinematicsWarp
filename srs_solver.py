@@ -1785,13 +1785,19 @@ class SRSSolver:
             raise ValueError("preferred_velocity must have shape (7,) or (N, 7)")
         if not bool(torch.isfinite(preferred).all()):
             raise ValueError("preferred_velocity must contain finite values")
-        projector = (
-            torch.eye(7, dtype=jacobian.dtype, device=self.device).expand(
-                jacobian.shape[0], -1, -1
-            )
-            - torch.linalg.pinv(jacobian) @ jacobian
+        # Project through orthonormal null-space vectors directly. Forming
+        # I - pinv(J) @ J amplifies roundoff when J is nearly singular.
+        _, singular, vh = torch.linalg.svd(jacobian, full_matrices=True)
+        cutoff = (
+            singular[:, :1] * max(jacobian.shape[-2:]) * torch.finfo(jacobian.dtype).eps
         )
-        velocity = (projector @ preferred.unsqueeze(-1)).squeeze(-1)
+        null = torch.cat(
+            (singular <= cutoff, torch.ones_like(singular[:, :1], dtype=torch.bool)),
+            dim=1,
+        )
+        coefficients = (vh @ preferred.unsqueeze(-1)).squeeze(-1)
+        coefficients = coefficients.masked_fill(~null, 0.0)
+        velocity = (vh.transpose(1, 2) @ coefficients.unsqueeze(-1)).squeeze(-1)
         return velocity[0] if squeeze else velocity
 
     def get_null_space_direction(self, qpos: np.ndarray | torch.Tensor) -> torch.Tensor:

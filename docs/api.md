@@ -30,8 +30,10 @@ Batch conventions:
   `8 * cfg.num_samples`; invalid slots are zero and valid solutions are first
   when sorting is enabled.
 - `get_jacobian()` returns analytical world-frame Jacobians from one joint-chain traversal, including base/tool transforms and joint rotation directions.
-- `get_null_space_direction()` and `get_null_space_velocity()` expose the
-  one-dimensional redundancy used by fixed-TCP secondary objectives.
+- `get_null_space_direction()` returns one deterministic unit null direction.
+  `get_null_space_velocity()` projects into the full Jacobian null space through
+  orthonormal SVD vectors, retaining extra directions at singular poses. Its rank
+  cutoff follows [Torch’s default pseudoinverse threshold](https://docs.pytorch.org/docs/stable/generated/torch.linalg.pinv.html).
 - `get_configuration()` returns the shoulder/elbow/wrist branch and arm angle;
   `solve_configuration()` reconstructs that exact point on the IK manifold.
 - `solve_configurations(target, configurations, seed=None)` solves a list or

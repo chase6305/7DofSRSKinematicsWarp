@@ -146,3 +146,26 @@ Measure the current implementations with the cross-backend tool:
 ```bash
 python ../7DofSRSKinematics/tools/compare_backends.py --warp-repo . --samples 40 --num-samples 73
 ```
+
+## Null-space projection near singular poses
+
+`get_null_space_velocity` projects preferred velocities through the orthonormal
+null-space vectors from a full SVD. This retains extra null directions at
+singular poses and avoids cancellation from constructing `I - pinv(J) @ J`.
+The rank cutoff matches Torch's default pseudoinverse cutoff.
+
+A local comparison used fixed float32 Jacobians, random preferred velocities,
+three warmups and 15 interleaved repeats. The reference uses float64 SVD on the
+same Jacobians and the same float32 rank cutoff:
+
+| Device / batch | Maximum task residual before → after | Maximum component error versus float64 before → after |
+|:--|--:|--:|
+| CPU / 512 | 2.70e-6 → 2.65e-7 | 4.09e-6 → 3.08e-6 rad/s |
+| CUDA / 4096 | 4.59e-6 → 2.41e-7 | 2.02e-5 → 4.12e-6 rad/s |
+
+The task residual is `max(norm(J @ velocity))` and mixes linear/angular velocity
+units. These measurements exclude Jacobian generation. Runtime was 2.08 →
+1.98 ms on CPU and 1.15 → 1.14 ms on CUDA; the numerical improvement is the main
+benefit. The environment matches the CUDA scoring benchmark above. Tests check
+annihilated task velocity, idempotence, non-increasing velocity norm, exact and
+near-straight singular configurations, input preservation and empty batches.

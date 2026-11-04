@@ -371,3 +371,29 @@ def test_nearest_weight_ranking_ignores_finite_common_scale(
             solver.cfg.ik_nearest_weight, weights * multiplier
         )
     torch.testing.assert_close(outputs[0], outputs[1], atol=1e-6, rtol=0)
+
+
+@pytest.mark.parametrize("use_warp,device", BACKENDS)
+def test_null_space_projection_properties_and_empty_batches(use_warp, device):
+    solver = make_solver(use_warp, device)
+    near_straight = Q.copy()
+    near_straight[3] = 1e-4
+    joints = np.array([Q, -Q, np.zeros(7), near_straight])
+    preferred = torch.linspace(-0.7, 0.9, 28, device=device).reshape(4, 7)
+    preserved = preferred.clone()
+    projected = solver.get_null_space_velocity(joints, preferred)
+    jacobian = solver.get_jacobian(joints)
+    assert projected.shape == (4, 7)
+    assert float(torch.linalg.vector_norm(jacobian @ projected[..., None])) < 1e-5
+    torch.testing.assert_close(
+        solver.get_null_space_velocity(joints, projected), projected, atol=2e-6, rtol=0
+    )
+    assert bool(
+        (
+            torch.linalg.vector_norm(projected, dim=1)
+            <= torch.linalg.vector_norm(preferred, dim=1) + 2e-6
+        ).all()
+    )
+    torch.testing.assert_close(preferred, preserved)
+    empty = solver.get_null_space_velocity(np.empty((0, 7)), np.empty((0, 7)))
+    assert empty.shape == (0, 7)
