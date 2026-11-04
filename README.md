@@ -4,9 +4,15 @@
 
 基于 NVIDIA Warp 的 7 自由度 S-R-S 解析运动学，提供 Torch 批量接口与 CPU 回退。
 
-![固定 TCP 自运动与 8 字轨迹跟踪实录](docs/media/demo.gif)
+**Demo 1 · 固定 TCP 自运动，臂角 ±90°**
 
-固定 TCP 自运动 → 8 字轨迹跟踪，10 秒 Warp/CPU 实录。
+![末端固定、肘部大幅度自运动](docs/media/self-motion.gif)
+
+**Demo 2 · 8 字轨迹跟踪，180 × 90 mm**
+
+![8 字参考路径与实际末端轨迹](docs/media/trajectory.gif)
+
+两段独立的 Warp/CPU 实录，每段 10 秒。
 
 - GPU 批量 FK / IK、解析雅可比和八种肩肘腕分支。
 - 与 NumPy 参考实现交叉校验，内置一致的 KUKA iiwa 7 R800 模型。
@@ -18,7 +24,7 @@ Python 3.10+：
 
 ```bash
 python -m pip install -e '.[viewer]'
-srs-warp-lab --backend warp --device cpu --autoplay
+srs-warp-lab --backend warp --device cpu --demo arm-angle --amplitude 90 --frequency 0.1 --joint-speed 2 --autoplay
 ```
 
 打开 **http://127.0.0.1:8081**，通过 Experiment 切换实验。
@@ -31,6 +37,8 @@ srs-warp-lab --backend warp --device cpu --autoplay
 | Jacobian | 速度椭球与固定 TCP 的关节居中 |
 | TCP trajectory | 直线、圆、8 字路径与实际轨迹对照 |
 | Self-motion manifold | 固定 TCP 的关节空间分支曲线 |
+
+第二个 demo：`srs-warp-lab --backend warp --device cpu --demo trajectory --path-size 0.09 --frequency 0.1 --autoplay`。
 
 [截图、控制方式与 CSV 导出 →](docs/demos.md)
 
