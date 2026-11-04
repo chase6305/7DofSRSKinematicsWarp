@@ -221,8 +221,8 @@ non-default CUDA streams are covered by tests.
 The native FK kernel unrolls its seven-joint chain so Warp Tape retains the
 intermediate poses required for reverse mode. A dynamic loop previously
 produced incorrect derivatives even though forward poses were correct. CPU/CUDA
-tests compare Tape position gradients with the analytical Jacobian, including
-reversed joint axes and a translated TCP. Generic native FK joint counts retain
+tests compare Tape position/orientation gradients with the analytical Jacobian,
+including reversed joint axes and a translated/rotated TCP. Generic native FK joint counts retain
 their previous forward computation.
 
 CPU compatibility checks include Warp 1.5.0 / NumPy 1.24.4 in CI. Kernel control
@@ -268,8 +268,8 @@ states/transform graphs while sharing source meshes and link-local GLB bytes.
 All eight instances remain lazy and are reused after mode switches. Integration
 checks compare cached GLBs byte-for-byte with normal Viser exports.
 
-The shared viewer implementation reduced the first gallery switch from 489 ms
-to 230 ms in a local NumPy-backend comparison against companion commit
+The shared viewer implementation reduced the first gallery switch from 545 ms
+to 254 ms in a local NumPy-backend comparison against companion commit
 `8174d96` (seven interleaved trials after one warmup). It includes IK and server
 scene construction, excluding initial app construction, browser, network and
 WebGL. See [environment and raw measurements](benchmarks/viewer.json).

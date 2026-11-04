@@ -56,6 +56,7 @@ iiwa 7 R800 geometry, URDF path and joint limits directly.
 - `solve_configuration(target, configuration, joint_seed=None)` accepts an optional seed for periodic and singular solutions. Branch signs use physical angles, including DH offsets and reversed joint directions.
 - Joint weights must be finite and non-negative; rotation directions must be `-1` or `1`; sampling requires an integer of at least two. Pose inputs must be rigid homogeneous transforms. Explicit zero-width limits are retained.
 - Empty batches return empty outputs of the documented shapes. Importing the library does not configure application logging.
+- Reversed NumPy slices such as `q[::-1]` and `q[:, ::-1]` are accepted. Views with negative strides are copied before tensor conversion, including joint states, IK targets/seeds and TCP transforms.
 - Wheels include the URDF and all visual/collision meshes; the solver, viewer and demo resolve installed resources outside the source checkout.
 
 Mixed shoulder/wrist requests in `solve_configurations` are decomposed together

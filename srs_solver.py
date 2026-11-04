@@ -79,6 +79,13 @@ def _torch_stream(device: torch.device):
     return wp.ScopedStream(stream, sync_exit=True)
 
 
+def _as_tensor(value, *args, **kwargs):
+    """Accept reversed NumPy views that Torch cannot wrap directly."""
+    if isinstance(value, np.ndarray) and any(stride < 0 for stride in value.strides):
+        value = value.copy()
+    return torch.as_tensor(value, *args, **kwargs)
+
+
 def _validate_pose(pose, name="transform", tolerance=1e-6):
     pose = np.asarray(pose, dtype=float)
     if pose.shape != (4, 4) or not np.all(np.isfinite(pose)):
@@ -830,7 +837,7 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
                     if self._valid_poses(joints, target):
                         output[row, 0], success[row] = joints, True
                         break
-        return torch.as_tensor(success, device=self.device), torch.as_tensor(
+        return _as_tensor(success, device=self.device), _as_tensor(
             output, device=self.device
         )
 
@@ -1499,7 +1506,7 @@ class SRSSolver:
 
     def set_tcp(self, transform: np.ndarray | torch.Tensor) -> None:
         """Set the flange-to-tool transform and refresh cached device constants."""
-        tcp = np.asarray(torch.as_tensor(transform).detach().cpu(), dtype=np.float64)
+        tcp = np.asarray(_as_tensor(transform).detach().cpu(), dtype=np.float64)
         _validate_pose(tcp)
         self.cfg.tcp = tcp.copy()
         with _torch_stream(self.device):
@@ -1513,14 +1520,14 @@ class SRSSolver:
 
     def get_arm_angle(self, qpos: np.ndarray | torch.Tensor) -> float:
         """Measure elbow-plane rotation around the shoulder-to-wrist axis."""
-        joints = np.asarray(torch.as_tensor(qpos).detach().cpu(), dtype=np.float64)
+        joints = np.asarray(_as_tensor(qpos).detach().cpu(), dtype=np.float64)
         if joints.shape != (7,) or not np.all(np.isfinite(joints)):
             raise ValueError("qpos must be a finite array of shape (7,)")
         return self._geometry_impl._get_arm_angle(joints)
 
     def get_configuration(self, qpos: np.ndarray | torch.Tensor) -> SRSConfiguration:
         """Return the current S/E/W branch and continuous arm angle."""
-        joints = np.asarray(torch.as_tensor(qpos).detach().cpu(), dtype=np.float64)
+        joints = np.asarray(_as_tensor(qpos).detach().cpu(), dtype=np.float64)
         if joints.shape != (7,) or not np.all(np.isfinite(joints)):
             raise ValueError("qpos must be a finite array of shape (7,)")
 
@@ -1545,16 +1552,14 @@ class SRSSolver:
         joint_seed: np.ndarray | torch.Tensor | None = None,
     ) -> tuple[bool, torch.Tensor | None]:
         """Solve one explicitly selected branch at an exact arm angle."""
-        target = np.asarray(
-            torch.as_tensor(target_xpos).detach().cpu(), dtype=np.float64
-        )
+        target = np.asarray(_as_tensor(target_xpos).detach().cpu(), dtype=np.float64)
         _validate_pose(target, "target_xpos")
         if not isinstance(configuration, SRSConfiguration):
             raise TypeError("configuration must be an SRSConfiguration")
         seed = (
             np.zeros(7)
             if joint_seed is None
-            else np.asarray(torch.as_tensor(joint_seed).detach().cpu(), dtype=float)
+            else np.asarray(_as_tensor(joint_seed).detach().cpu(), dtype=float)
         )
         if seed.shape != (7,) or not np.all(np.isfinite(seed)):
             raise ValueError("joint_seed must be a finite array of shape (7,)")
@@ -1570,7 +1575,7 @@ class SRSSolver:
         actual = self._geometry_impl._get_fk(joints)
         if not np.allclose(actual, target, atol=1e-4, rtol=0.0):
             return False, None
-        return True, torch.as_tensor(joints, dtype=torch.float32, device=self.device)
+        return True, _as_tensor(joints, dtype=torch.float32, device=self.device)
 
     def _update_impl_qpos_limits(self):
         with _torch_stream(self.device):
@@ -1594,12 +1599,12 @@ class SRSSolver:
         preserving input order and zeroing invalid rows. Geometry is prepared at
         most once per elbow branch; arm angles and FK validation are batched.
         """
-        target = np.asarray(torch.as_tensor(target_xpos).detach().cpu(), dtype=float)
+        target = np.asarray(_as_tensor(target_xpos).detach().cpu(), dtype=float)
         _validate_pose(target, "target_xpos")
         seed = (
             np.zeros(7)
             if joint_seed is None
-            else np.asarray(torch.as_tensor(joint_seed).detach().cpu(), dtype=float)
+            else np.asarray(_as_tensor(joint_seed).detach().cpu(), dtype=float)
         )
         if seed.shape != (7,) or not np.all(np.isfinite(seed)):
             raise ValueError("joint_seed must be a finite array of shape (7,)")
@@ -1630,8 +1635,8 @@ class SRSSolver:
                 success[rows] = np.all(np.abs(actual - target) <= 1e-4, axis=(-2, -1))
             output[~success] = 0
         return (
-            torch.as_tensor(success, device=self.device),
-            torch.as_tensor(output, dtype=torch.float32, device=self.device),
+            _as_tensor(success, device=self.device),
+            _as_tensor(output, dtype=torch.float32, device=self.device),
         )
 
     def update_with_robot_limit(self, robot_qpos_limits):
@@ -1657,7 +1662,7 @@ class SRSSolver:
         Warp execution launches one thread per robot.  The result always
         has shape ``(N, 4, 4)`` on the solver device.
         """
-        qpos_tensor = torch.as_tensor(qpos, dtype=torch.float32, device=self.device)
+        qpos_tensor = _as_tensor(qpos, dtype=torch.float32, device=self.device)
         if qpos_tensor.ndim == 1:
             qpos_tensor = qpos_tensor.unsqueeze(0)
         if qpos_tensor.ndim != 2 or qpos_tensor.shape[1] != 7:
@@ -1668,7 +1673,7 @@ class SRSSolver:
             if not bool(torch.isfinite(qpos_tensor).all()):
                 raise ValueError("qpos must contain only finite values")
             poses = self.impl._get_fk(qpos_tensor.detach().cpu().numpy())
-            return torch.as_tensor(poses, dtype=qpos_tensor.dtype, device=self.device)
+            return _as_tensor(poses, dtype=qpos_tensor.dtype, device=self.device)
 
         with _torch_stream(self.device):
             warp_device = standardize_device_string(self.device)
@@ -1699,7 +1704,7 @@ class SRSSolver:
         All poses are in world coordinates. Accepts (7,) or (N, 7), including
         empty batches. Each call owns its outputs, so later calls cannot overwrite them.
         """
-        joints = torch.as_tensor(qpos, dtype=torch.float32, device=self.device)
+        joints = _as_tensor(qpos, dtype=torch.float32, device=self.device)
         if joints.ndim == 1:
             joints = joints.unsqueeze(0)
         if (
@@ -1740,7 +1745,7 @@ class SRSSolver:
             pose = pose @ transforms[:, index]
             poses.append(pose)
         poses.append(pose @ self.cfg.T_e_oe @ self.cfg.tcp)
-        return torch.as_tensor(
+        return _as_tensor(
             np.stack(poses, axis=1), dtype=joints.dtype, device=self.device
         )
 
@@ -1753,7 +1758,7 @@ class SRSSolver:
         """
         if not np.isfinite(step) or step <= 0:
             raise ValueError("step must be positive and finite")
-        joints = torch.as_tensor(qpos, dtype=torch.float32, device=self.device)
+        joints = _as_tensor(qpos, dtype=torch.float32, device=self.device)
         squeeze = joints.ndim == 1
         if squeeze:
             joints = joints.unsqueeze(0)
@@ -1796,7 +1801,7 @@ class SRSSolver:
             axes = np.stack(axes, axis=1)
             linear = np.cross(axes, tcp[:, None] - np.stack(origins, axis=1))
             jacobian = np.concatenate((linear, axes), axis=-1).transpose(0, 2, 1)
-            output = torch.as_tensor(jacobian, dtype=joints.dtype, device=self.device)
+            output = _as_tensor(jacobian, dtype=joints.dtype, device=self.device)
         return output[0] if squeeze else output
 
     def get_null_space_velocity(
@@ -1809,7 +1814,7 @@ class SRSSolver:
         squeeze = jacobian.ndim == 2
         if squeeze:
             jacobian = jacobian.unsqueeze(0)
-        preferred = torch.as_tensor(
+        preferred = _as_tensor(
             preferred_velocity, dtype=jacobian.dtype, device=self.device
         )
         if preferred.ndim == 1:
@@ -1876,17 +1881,13 @@ class SRSSolver:
             raise ValueError(
                 "Warp batch IK supports search_mode='global'; continuous mode uses the NumPy backend"
             )
-        target_xpos = torch.as_tensor(
-            target_xpos, dtype=torch.float32, device=self.device
-        )
+        target_xpos = _as_tensor(target_xpos, dtype=torch.float32, device=self.device)
         if target_xpos.ndim == 2:
             target_xpos = target_xpos.unsqueeze(0)
         if target_xpos.ndim != 3 or target_xpos.shape[1:] != (4, 4):
             raise ValueError("target_xpos must have shape (4, 4) or (N, 4, 4)")
         if qpos_seed is not None:
-            qpos_seed = torch.as_tensor(
-                qpos_seed, dtype=torch.float32, device=self.device
-            )
+            qpos_seed = _as_tensor(qpos_seed, dtype=torch.float32, device=self.device)
             if qpos_seed.ndim == 1:
                 qpos_seed = qpos_seed.unsqueeze(0)
             if qpos_seed.shape != (target_xpos.shape[0], 7):

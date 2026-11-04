@@ -12,11 +12,12 @@ DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 
 
 @pytest.mark.parametrize("device", DEVICES)
-def test_fk_tape_gradient_matches_analytical_linear_jacobian(device):
+def test_fk_tape_gradient_matches_analytical_jacobian(device):
     cfg = SRSSolverCfg()
     cfg.T_b_ob[:3, :3] = [[0, -1, 0], [1, 0, 0], [0, 0, 1]]
     cfg.T_b_ob[:3, 3] = [0.2, -0.1, 0.3]
     cfg.tcp[:3, 3] = [0.06, -0.02, 0.08]
+    cfg.tcp[:3, :3] = [[1, 0, 0], [0, 0, -1], [0, 1, 0]]
     cfg.rotation_directions = np.array([-1, 1, -1, 1, -1, 1, -1])
     solver = SRSSolver(cfg, 2, device, use_warp=True)
     q = np.array(
@@ -28,6 +29,7 @@ def test_fk_tape_gradient_matches_analytical_linear_jacobian(device):
     flags = wp.empty(2, dtype=int, device=device)
     seed = np.zeros((2, 4, 4), dtype=np.float32)
     seed[:, :3, 3] = [1, 2, -0.5]
+    seed[:, :3, :3] = [[0.2, -0.1, 0.3], [-0.4, 0.7, 0.1], [0.5, -0.2, 0.6]]
     stream = wp.stream_from_torch(device) if device == "cuda" else None
     with wp.ScopedStream(stream, sync_exit=True):
         with wp.Tape() as tape:
@@ -47,11 +49,23 @@ def test_fk_tape_gradient_matches_analytical_linear_jacobian(device):
             )
         tape.backward(grads={poses: wp.array(seed, dtype=wp.mat44, device=device)})
         actual = wp.to_torch(joints.grad).view(2, 7).clone()
+        rotation = wp.to_torch(poses)[:, :3, :3].clone()
     jacobian = solver.get_jacobian(q)
-    expected = torch.einsum(
-        "c,ncj->nj", torch.tensor([1, 2, -0.5], device=device), jacobian[:, :3]
+    # dR = skew(omega) @ R maps a matrix cotangent into world angular velocity.
+    weighted_rotation = torch.tensor(
+        seed[:, :3, :3], device=device
+    ) @ rotation.transpose(1, 2)
+    angular = torch.stack(
+        (
+            weighted_rotation[:, 2, 1] - weighted_rotation[:, 1, 2],
+            weighted_rotation[:, 0, 2] - weighted_rotation[:, 2, 0],
+            weighted_rotation[:, 1, 0] - weighted_rotation[:, 0, 1],
+        ),
+        dim=1,
     )
-    torch.testing.assert_close(actual, expected, atol=5e-7, rtol=0)
+    cotangent = torch.cat((torch.tensor(seed[:, :3, 3], device=device), angular), dim=1)
+    expected = torch.einsum("nc,ncj->nj", cotangent, jacobian)
+    torch.testing.assert_close(actual, expected, atol=8e-7, rtol=0)
 
 
 @pytest.mark.parametrize("device", DEVICES)
