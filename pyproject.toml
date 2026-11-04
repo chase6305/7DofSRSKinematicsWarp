@@ -42,7 +42,7 @@ packages = ["example", "srs_kinematics_warp_assets", "srs_warp_viser"]
 srs_kinematics_warp_assets = "urdf"
 
 [tool.setuptools.package-data]
-srs_kinematics_warp_assets = ["*.urdf", "meshes/*.dae", "meshes/*.stl"]
+srs_kinematics_warp_assets = ["*.urdf", "README.md", "ASSET_LICENSE", "visual/*.glb", "collision/*.stl", "meshes/*.dae", "meshes/*.stl"]
 
 [tool.pytest.ini_options]
 testpaths = ["test"]
