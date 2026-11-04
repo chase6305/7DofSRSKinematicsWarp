@@ -9,15 +9,17 @@ import numpy as np
 import torch
 import warp as wp
 from warp_kernel import (
+    IKGeometry,
     check_success_kernel,
     compute_fk_chain_kernel,
     compute_fk_kernel,
-    compute_ik_kernel,
+    compute_prepared_ik_kernel,
     compute_jacobian_kernel,
     ik_distance_kernel,
     nearest_ik_kernel,
+    prepare_ik_geometry_kernel,
     sort_ik_kernel,
-    transform_pose_kernel,
+    validate_ik_inputs_kernel,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,24 +53,19 @@ def _ensure_writable_warp_cache() -> None:
         wp.config.kernel_cache_dir = str(fallback)
 
 
+def _resolve_device(device: str | torch.device) -> torch.device:
+    """Keep Torch and Warp on the same concrete device for the solver lifetime."""
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    if device.type == "cpu":
+        return torch.device("cpu")
+    return device
+
+
 def standardize_device_string(device: str | torch.device) -> str:
-    """Standardize the device string for Warp compatibility.
-
-    Args:
-        device (Union[str, torch.device]): The device specification.
-
-    Returns:
-        str: The standardized device string.
-    """
-    if isinstance(device, str):
-        device_str = device
-    else:
-        device_str = str(device)
-
-    if device_str == "cuda":
-        device_str = "cuda:0"
-
-    return device_str
+    """Resolve Torch aliases, including the current unindexed CUDA device."""
+    return str(_resolve_device(device))
 
 
 def _torch_stream(device: torch.device):
@@ -905,6 +902,9 @@ class _WarpSRSSolverImpl(_BaseSRSSolverImpl):
         self._refresh_weights()
         self._workspace_key = None
         self._workspace = {}
+        self._validation_error = wp.zeros(
+            1, dtype=int, device=standardize_device_string(self.device)
+        )
 
     def _refresh_weights(self):
         """Refresh device constants after a live configuration weight edit."""
@@ -948,6 +948,7 @@ class _WarpSRSSolverImpl(_BaseSRSSolverImpl):
         self._workspace_key = key
         self._workspace = {
             "xpos": wp.empty(num_targets, dtype=wp.mat44, device=device),
+            "geometry": wp.empty(num_targets * 2, dtype=IKGeometry, device=device),
             "qpos": wp.empty(num_combinations * 7, dtype=float, device=device),
             "success": wp.empty(num_combinations, dtype=int, device=device),
         }
@@ -1207,6 +1208,7 @@ class _WarpSRSSolverImpl(_BaseSRSSolverImpl):
         success_wp: wp.array,
         num_combinations: int,
         qpos_seed: torch.Tensor,
+        geometry_wp: wp.array,
     ) -> None:
         """
         Compute IK solutions using the provided combinations.
@@ -1219,15 +1221,15 @@ class _WarpSRSSolverImpl(_BaseSRSSolverImpl):
         """
         # Launch kernel to compute IK solutions
         wp.launch(
-            kernel=compute_ik_kernel,
+            kernel=compute_prepared_ik_kernel,
             dim=num_combinations,
             inputs=(
                 xpos_wp,
+                geometry_wp,
                 self.elbow_angles_wp,
                 self.qpos_limits_wp,
                 self.configs_wp,
                 self.dh_params_wp,
-                self.link_lengths_wp,
                 self.rotation_directions_wp,
                 wp.from_torch(qpos_seed.contiguous().flatten()),
                 self.nearest_weights_wp,
@@ -1235,6 +1237,32 @@ class _WarpSRSSolverImpl(_BaseSRSSolverImpl):
             outputs=[success_wp, qpos_out_wp],
             device=standardize_device_string(self.device),
         )
+
+    def _validate_inputs(self, targets, seed):
+        """Report the same input errors with one device-to-host status read."""
+        self._validation_error.zero_()
+        wp.launch(
+            validate_ik_inputs_kernel,
+            dim=targets.shape[0],
+            inputs=[
+                wp.from_torch(targets.contiguous(), dtype=wp.mat44),
+                (
+                    wp.from_torch(seed.contiguous().flatten())
+                    if seed is not None
+                    else None
+                ),
+                int(seed is not None),
+            ],
+            outputs=[self._validation_error],
+            device=standardize_device_string(self.device),
+        )
+        code = int(wp.to_torch(self._validation_error)[0].item())
+        if code == 3:
+            raise ValueError("target_xpos must contain only finite values")
+        if code == 2:
+            raise ValueError("target_xpos must contain rigid homogeneous transforms")
+        if code == 1:
+            raise ValueError("qpos_seed must contain only finite values")
 
     def get_ik(
         self,
@@ -1269,15 +1297,17 @@ class _WarpSRSSolverImpl(_BaseSRSSolverImpl):
         # transform pose
         xpos_wp = workspace["xpos"]
         wp.launch(
-            kernel=transform_pose_kernel,
-            dim=target_xpos_wp.shape[0],
+            kernel=prepare_ik_geometry_kernel,
+            dim=target_xpos_wp.shape[0] * 2,
             inputs=[
                 target_xpos_wp,
                 self.T_b_ob_inv_wp,
                 self.T_e_oe_inv_wp,
                 self.tcp_inv_wp,
+                self.dh_params_wp,
+                self.link_lengths_wp,
             ],
-            outputs=[xpos_wp],
+            outputs=[xpos_wp, workspace["geometry"]],
             device=standardize_device_string(self.device),
         )
 
@@ -1302,7 +1332,12 @@ class _WarpSRSSolverImpl(_BaseSRSSolverImpl):
 
         # Compute IK solutions
         self._compute_ik_solutions(
-            xpos_wp, qpos_out_wp, success_wp, num_combinations, qpos_seed
+            xpos_wp,
+            qpos_out_wp,
+            success_wp,
+            num_combinations,
+            qpos_seed,
+            workspace["geometry"],
         )
 
         # Device-side masking below handles the all-failed case without a host
@@ -1363,11 +1398,8 @@ class SRSSolver:
         self.num_envs = num_envs
 
         if device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        elif isinstance(device, str):
-            self.device = torch.device(device)
-        else:
-            self.device = device
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = _resolve_device(device)
         self.use_warp = self.device.type == "cuda" if use_warp is None else use_warp
         if self.device.type == "cuda" and not self.use_warp:
             raise ValueError("CUDA execution requires the Warp backend")
@@ -1850,32 +1882,6 @@ class SRSSolver:
             target_xpos = target_xpos.unsqueeze(0)
         if target_xpos.ndim != 3 or target_xpos.shape[1:] != (4, 4):
             raise ValueError("target_xpos must have shape (4, 4) or (N, 4, 4)")
-        if not bool(torch.isfinite(target_xpos).all()):
-            raise ValueError("target_xpos must contain only finite values")
-        rotation = target_xpos[:, :3, :3]
-        identity = torch.eye(3, dtype=target_xpos.dtype, device=self.device)
-        bottom = torch.tensor([0, 0, 0, 1], dtype=target_xpos.dtype, device=self.device)
-        if (
-            not torch.allclose(
-                target_xpos[:, 3],
-                bottom.expand(target_xpos.shape[0], -1),
-                atol=1e-6,
-                rtol=0,
-            )
-            or not torch.allclose(
-                rotation.transpose(1, 2) @ rotation,
-                identity.expand(target_xpos.shape[0], -1, -1),
-                atol=1e-6,
-                rtol=0,
-            )
-            or not torch.allclose(
-                torch.linalg.det(rotation),
-                torch.ones(target_xpos.shape[0], device=self.device),
-                atol=1e-6,
-                rtol=0,
-            )
-        ):
-            raise ValueError("target_xpos must contain rigid homogeneous transforms")
         if qpos_seed is not None:
             qpos_seed = torch.as_tensor(
                 qpos_seed, dtype=torch.float32, device=self.device
@@ -1884,14 +1890,50 @@ class SRSSolver:
                 qpos_seed = qpos_seed.unsqueeze(0)
             if qpos_seed.shape != (target_xpos.shape[0], 7):
                 raise ValueError("qpos_seed must have shape (7,) or (N, 7)")
-            if not bool(torch.isfinite(qpos_seed).all()):
-                raise ValueError("qpos_seed must contain only finite values")
+            qpos_seed = qpos_seed.contiguous()
+        target_xpos = target_xpos.contiguous()
         if target_xpos.shape[0] == 0:
             slots = 8 * self.cfg.num_samples if return_all_solutions else 1
             return torch.empty(0, dtype=torch.bool, device=self.device), torch.empty(
                 (0, slots, 7), device=self.device
             )
         with _torch_stream(self.device):
+            if self.use_warp:
+                self.impl._validate_inputs(target_xpos, qpos_seed)
+            else:
+                if not bool(torch.isfinite(target_xpos).all()):
+                    raise ValueError("target_xpos must contain only finite values")
+                rotation = target_xpos[:, :3, :3]
+                identity = torch.eye(3, dtype=target_xpos.dtype, device=self.device)
+                bottom = torch.tensor(
+                    [0, 0, 0, 1], dtype=target_xpos.dtype, device=self.device
+                )
+                if (
+                    not torch.allclose(
+                        target_xpos[:, 3],
+                        bottom.expand(target_xpos.shape[0], -1),
+                        atol=1e-6,
+                        rtol=0,
+                    )
+                    or not torch.allclose(
+                        rotation.transpose(1, 2) @ rotation,
+                        identity.expand(target_xpos.shape[0], -1, -1),
+                        atol=1e-6,
+                        rtol=0,
+                    )
+                    or not torch.allclose(
+                        torch.linalg.det(rotation),
+                        torch.ones(target_xpos.shape[0], device=self.device),
+                        atol=1e-6,
+                        rtol=0,
+                    )
+                ):
+                    raise ValueError(
+                        "target_xpos must contain rigid homogeneous transforms"
+                    )
+                if qpos_seed is not None:
+                    if not bool(torch.isfinite(qpos_seed).all()):
+                        raise ValueError("qpos_seed must contain only finite values")
             return self.impl.get_ik(
                 target_xpos=target_xpos.contiguous(),
                 qpos_seed=qpos_seed,

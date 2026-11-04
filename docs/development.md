@@ -27,10 +27,12 @@ one thread to one `(target, branch, arm-angle sample)` tuple, so a launch covers
 `N * 8 * num_samples` candidates without Python loops. FK maps one thread to
 one joint configuration.
 
-Target-frame conversion, analytical candidate generation, limit checks and FK
-validation stay on the selected Warp device. Nearest-solution reduction and
-optional sorting use vectorized Torch operations on the same device. Repeated
-calls with an unchanged batch size reuse the large Warp work buffers.
+Input checks, target-frame conversion, analytical candidate generation, limit
+checks, FK verification and distance scoring stay on the selected Warp device.
+Two elbow geometries are prepared per target, then shared by its arm-angle and
+shoulder/wrist candidates. Torch performs nearest-solution reduction and stable
+sorting on that same device. Repeated calls with an unchanged batch size reuse
+the large Warp work buffers; geometric values are recomputed on each call.
 
 ## Repository Layout
 
@@ -169,3 +171,66 @@ units. These measurements exclude Jacobian generation. Runtime was 2.08 →
 benefit. The environment matches the CUDA scoring benchmark above. Tests check
 annihilated task velocity, idempotence, non-increasing velocity norm, exact and
 near-straight singular configurations, input preservation and empty batches.
+
+## Shared device geometry and input validation
+
+Global IK prepares two elbow geometries per target instead of repeating that
+work for every candidate. The preparation launch also converts world targets to
+the local arm frame, retaining the previous launch count. The public direct
+`compute_ik_kernel` signature remains available. Tests compare every candidate
+with that path, including singular poses, reversed joints, offsets, base/tool
+frames and changing targets/seeds.
+
+Finite/rigid target checks and seed checks now use one Warp pass and one host
+status read. They retain error priority and the 1e-6 rigid-transform tolerance;
+rejected batches do not poison subsequent calls. An additional stress run
+accepted 262,144 FK/external rigid transforms across CPU and CUDA. Unindexed
+`cuda` follows Torch's current device when creating the solver, then keeps that
+concrete device for subsequent calls. Indexed CPU aliases normalize to `cpu`.
+
+A local comparison against `8472c8b` used 73 arm-angle samples, seed offsets of
+0.02 rad, five warmups and 21 interleaved repeats. All candidate masks and selected
+joint tensors were bit-identical in the measured batches:
+
+| Device / targets | Before | After |
+|:--|--:|--:|
+| Warp CPU / 64 | 13.491 ms | 10.181 ms |
+| CUDA / 1 | 0.601 ms | 0.249 ms |
+| CUDA / 64 | 0.594 ms | 0.245 ms |
+| CUDA / 4096 | 0.962 ms | 0.480 ms |
+
+These are complete `get_ik` timings, including validation and result selection,
+with CUDA synchronization, excluding compilation and the viewer. The environment
+matches the CUDA scoring table above. Geometry storage adds 1.75 MiB at 4096
+targets (82.38 → 84.13 MiB of Warp workspace). Hardware/load affect timings;
+see the [raw measurements](benchmarks/global-ik.json). The parallel demo command
+above measures the current implementation.
+
+Distance scoring also handles finite seeds whose squared norms overflow
+float32. That exceptional path computes the norm in float64 and bounds it to a
+finite score, so invalid candidates remain behind valid ones. Ordinary control
+loop inputs retain float32 scoring. Regression tests cover nearest/all results,
+stable ties and zero-weight components at seeds up to 3e38.
+
+## Viewer startup and branch gallery
+
+The primary robot parses the URDF once. Gallery robots keep independent joint
+states/transform graphs while sharing source meshes and link-local GLB bytes.
+All eight instances remain lazy and are reused after mode switches. Integration
+checks compare cached GLBs byte-for-byte with normal Viser exports.
+
+The shared viewer implementation reduced the first gallery switch from 489 ms
+to 230 ms in a local NumPy-backend comparison against companion commit
+`8174d96` (seven interleaved trials after one warmup). It includes IK and server
+scene construction, excluding initial app construction, browser, network and
+WebGL. See [environment and raw measurements](benchmarks/viewer.json).
+
+Measure the current viewer with its optional dependencies installed:
+
+```bash
+python tools/benchmark_viewer.py --backend warp --device cpu --repeats 7 --output viewer-benchmark.json
+```
+
+The tool needs no browser. It measures startup and first/repeated gallery
+opening separately, verifies robot reuse and TCP residuals, and writes a new
+JSON file with dependency versions and samples.
