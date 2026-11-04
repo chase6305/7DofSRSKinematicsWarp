@@ -1662,12 +1662,11 @@ class SRSSolver:
             qpos_tensor = qpos_tensor.unsqueeze(0)
         if qpos_tensor.ndim != 2 or qpos_tensor.shape[1] != 7:
             raise ValueError("qpos must have shape (7,) or (N, 7)")
-        if not bool(torch.isfinite(qpos_tensor).all()):
-            raise ValueError("qpos must contain only finite values")
-
         if qpos_tensor.shape[0] == 0:
             return torch.empty((0, 4, 4), dtype=qpos_tensor.dtype, device=self.device)
         if not self.use_warp:
+            if not bool(torch.isfinite(qpos_tensor).all()):
+                raise ValueError("qpos must contain only finite values")
             poses = self.impl._get_fk(qpos_tensor.detach().cpu().numpy())
             return torch.as_tensor(poses, dtype=qpos_tensor.dtype, device=self.device)
 
@@ -1690,6 +1689,8 @@ class SRSSolver:
                 outputs=[poses, success],
                 device=warp_device,
             )
+            if not bool(wp.to_torch(success).all()):
+                raise ValueError("qpos must contain only finite values")
             return wp.to_torch(poses).view(-1, 4, 4)
 
     def get_all_fk_mat(self, qpos: np.ndarray | torch.Tensor) -> torch.Tensor:

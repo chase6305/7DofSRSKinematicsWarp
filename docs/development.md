@@ -212,6 +212,23 @@ finite score, so invalid candidates remain behind valid ones. Ordinary control
 loop inputs retain float32 scoring. Regression tests cover nearest/all results,
 stable ties and zero-weight components at seeds up to 3e38.
 
+FK also checks finite joints in its existing device launch. The public
+kernel marks nonfinite rows unsuccessful and writes zero poses; `get_fk`
+reports the same input error after reading those flags, avoiding a separate
+Torch finite-check pass. Strided batches, recovery after rejected rows and
+non-default CUDA streams are covered by tests.
+
+The native FK kernel unrolls its seven-joint chain so Warp Tape retains the
+intermediate poses required for reverse mode. A dynamic loop previously
+produced incorrect derivatives even though forward poses were correct. CPU/CUDA
+tests compare Tape position gradients with the analytical Jacobian, including
+reversed joint axes and a translated TCP. Generic native FK joint counts retain
+their previous forward computation.
+
+CPU compatibility checks include Warp 1.5.0 / NumPy 1.24.4 in CI. Kernel control
+flow uses branches supported by that older compiler; current Warp releases also
+run the full CPU/CUDA suite locally.
+
 ## Viewer startup and branch gallery
 
 The primary robot parses the URDF once. Gallery robots keep independent joint

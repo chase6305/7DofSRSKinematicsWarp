@@ -1,6 +1,5 @@
 import warp as wp
 
-
 @wp.func
 def identity_mat44() -> wp.mat44:
     # fmt: off
@@ -177,7 +176,8 @@ def calculate_arm_joint_angles(
     joints_val[3] = elbow_GC4 * safe_acos(elbow_cos_angle)
 
     # Compute shoulder angle
-    joints_val[0] = wp.atan2(y, x) if horizontal_distance > 1.0e-10 else 0.0
+    if horizontal_distance > 1.0e-10:
+        joints_val[0] = wp.atan2(y, x)
 
     # Compute joint 2 angle
     angle_phi = safe_acos(
@@ -276,6 +276,24 @@ def compute_reference_plane(
     res[tid] = 1
 
 
+@wp.func
+def joint_dh_transform(
+    joint_angles: wp.array(dtype=float),
+    dh_params: wp.array(dtype=float),
+    rotation_directions: wp.array(dtype=float),
+    robot_offset: int,
+    joint: int,
+) -> wp.mat44:
+    offset = joint * 4
+    return dh_transform(
+        dh_params[offset],
+        dh_params[offset + 1],
+        dh_params[offset + 2],
+        dh_params[offset + 3]
+        + joint_angles[robot_offset + joint] * rotation_directions[joint],
+    )
+
+
 @wp.kernel
 def compute_fk_kernel(
     joint_angles: wp.array(dtype=float),
@@ -300,23 +318,34 @@ def compute_fk_kernel(
         tcp_transform (wp.mat44): Tool center point (TCP) transformation matrix.
         pose_out (wp.array): Output array for computed poses ([N, 4x4]).
         success (wp.array): Output array indicating whether FK computation was successful ([N]).
+
+    Nonfinite joint rows receive a zero pose and success=0. Finite rows retain
+    the same DH computation, with validation in the same kernel launch.
+    Seven-joint chains are unrolled to preserve intermediate values for Warp
+    Tape gradients. Other joint counts retain the generic forward traversal.
     """
     tid = wp.tid()
     num_joints = rotation_directions.shape[0]
 
-    # Initialize pose as identity matrix
-    pose = identity_mat44()
-
-    # Loop through each joint and apply DH transformation
     for i in range(num_joints):
-        base_idx = i * 4
-        d = dh_params[base_idx + 0]
-        alpha = dh_params[base_idx + 1]
-        a = dh_params[base_idx + 2]
-        theta = dh_params[base_idx + 3]
-        theta += joint_angles[tid * num_joints + i] * rotation_directions[i]
-        T = dh_transform(d, alpha, a, theta)
-        pose = pose @ T
+        angle = joint_angles[tid * num_joints + i]
+        if not wp.isfinite(angle):
+            pose_out[tid] = wp.mat44()
+            success[tid] = 0
+            return
+
+    pose = identity_mat44()
+    if num_joints == 7:
+        # A fixed bound lets Warp retain each primal pose for reverse mode.
+        for i in range(7):
+            pose = pose @ joint_dh_transform(
+                joint_angles, dh_params, rotation_directions, tid * 7, i
+            )
+    else:
+        for i in range(num_joints):
+            pose = pose @ joint_dh_transform(
+                joint_angles, dh_params, rotation_directions, tid * num_joints, i
+            )
 
     # Apply additional transforms: base, end-effector, TCP
     pose = T_b_ob @ pose @ T_oe_e @ tcp_transform
@@ -529,7 +558,9 @@ def validate_fk_with_target(
     pose_error = frobenius_norm(pose_diff)
 
     # Validate against tolerance
-    return 1 if pose_error <= tolerance else 0
+    if pose_error <= tolerance:
+        return 1
+    return 0
 
 
 @wp.kernel
@@ -552,7 +583,9 @@ def validate_ik_inputs_kernel(
         return
     code = int(0)
     for column in range(4):
-        expected = 1.0 if column == 3 else 0.0
+        expected = 0.0
+        if column == 3:
+            expected = 1.0
         if wp.abs(target[3, column] - expected) > 1.0e-6:
             code = 2
     for row in range(3):
@@ -560,7 +593,9 @@ def validate_ik_inputs_kernel(
             dot = 0.0
             for inner in range(3):
                 dot += target[inner, row] * target[inner, column]
-            expected = 1.0 if row == column else 0.0
+            expected = 0.0
+            if row == column:
+                expected = 1.0
             if wp.abs(dot - expected) > 1.0e-6:
                 code = 2
     rotation = wp.mat33(
@@ -636,7 +671,9 @@ def prepare_ik_geometry(
         return geometry
     q4 = elbow_config * safe_acos(elbow_cos)
     horizontal = wp.length(wp.vec2(P26.x, P26.y))
-    ref_q1 = wp.atan2(P26.y, P26.x) if horizontal > 1.0e-10 else 0.0
+    ref_q1 = 0.0
+    if horizontal > 1.0e-10:
+        ref_q1 = wp.atan2(P26.y, P26.x)
     phi = safe_acos(
         (
             d_se * d_se
@@ -957,7 +994,9 @@ def prepare_ik_geometry_kernel(
     tid = wp.tid()
     target_idx = tid // 2
     elbow_idx = tid - target_idx * 2
-    elbow = 1.0 if elbow_idx == 0 else -1.0
+    elbow = -1.0
+    if elbow_idx == 0:
+        elbow = 1.0
     local = transform_pose(target_xpos[target_idx], T_b_ob_inv, T_e_oe_inv, tcp_inv)
     if elbow_idx == 0:
         local_targets[target_idx] = local
@@ -987,7 +1026,9 @@ def compute_prepared_ik_kernel(
     config_idx = local_idx // num_angles
     angle_idx = local_idx - config_idx * num_angles
     config = configs[config_idx]
-    elbow_idx = 0 if config.y > 0.0 else 1
+    elbow_idx = 1
+    if config.y > 0.0:
+        elbow_idx = 0
     geometry = geometries[target_idx * 2 + elbow_idx]
     evaluate_ik_candidate(
         geometry,
