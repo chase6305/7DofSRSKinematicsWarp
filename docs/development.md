@@ -84,3 +84,40 @@ benchmark includes adapter/request construction and verifies TCP residuals:
 ```bash
 python tools/benchmark_srs.py --backend warp --device cpu --frames 180 --repeats 15
 ```
+
+## CUDA candidate scoring
+
+Global Warp IK now scores one candidate per thread into a reused scalar buffer.
+It avoids materializing the two `(N, 8 * samples, 7)` subtraction/multiplication
+arrays. Torch still performs the stable sort or first-minimum reduction;
+zero-weight ties retain candidate order and invalid rows remain zero.
+
+A local comparison isolated Torch scoring versus the fused Warp score kernel,
+with the same stream handling and normalized weights in both versions. Each
+batch used 73 samples, seed offsets of 0.02 rad, three warmup calls and 15
+interleaved, synchronized repeats. The selected joints were bit-identical for
+all targets:
+
+| Targets | Torch scoring | Fused scoring | Torch peak temporary allocation, before → after |
+|--:|--:|--:|--:|
+| 64 | 0.645 ms | 0.623 ms | 2.03 → 0.04 MiB |
+| 1024 | 0.679 ms | 0.634 ms | 32.57 → 0.64 MiB |
+| 4096 | 1.029 ms | 0.826 ms | 130.28 → 2.57 MiB |
+
+The reused Warp score buffer adds 9.13 MiB at 4096 targets, increasing the Warp
+workspace from 73.25 to 82.38 MiB. The table's allocation figures count Torch
+allocations only; they exclude Warp buffers and cached allocator reservations.
+These measurements use Python 3.10, Torch 2.13.0+cu130, Warp 1.16.0 and an RTX
+5090 D v2. They include input validation and result selection, exclude kernel
+compilation and the viewer, and vary with hardware and load.
+
+Run the current global CUDA workload with:
+
+```bash
+srs-parallel-demo --device cuda --batch-size 4096 --num-samples 73 --repeats 20
+```
+
+Tests cover uniform, unequal and zero weights; all/nearest results; failed rows;
+workspace resize; retained outputs; live weight edits; and launches on two
+non-default PyTorch streams. CPU kernels run in CI; CUDA checks activate when a
+device is available.

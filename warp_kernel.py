@@ -937,6 +937,30 @@ def sort_ik_kernel(
 
 
 @wp.kernel
+def ik_distance_kernel(
+    qpos_out: wp.array(dtype=float),
+    success: wp.array(dtype=int),
+    qpos_seed: wp.array(dtype=float),
+    weights: wp.array(dtype=float),
+    solutions_per_target: int,
+    distances: wp.array(dtype=float),
+):
+    """Score each candidate without materializing (N, solutions, 7) temporaries."""
+    candidate = wp.tid()
+    distance = wp.inf
+    if success[candidate] != 0:
+        target = candidate // solutions_per_target
+        squared_distance = 0.0
+        for joint in range(7):
+            delta = (
+                qpos_out[candidate * 7 + joint] - qpos_seed[target * 7 + joint]
+            ) * weights[joint]
+            squared_distance += delta * delta
+        distance = wp.sqrt(squared_distance)
+    distances[candidate] = distance
+
+
+@wp.kernel
 def nearest_ik_kernel(
     qpos_out: wp.array(dtype=float),  # [N * N_SOL * 7]
     success: wp.array(dtype=int),  # [N * N_SOL]

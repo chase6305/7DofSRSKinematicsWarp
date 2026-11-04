@@ -60,4 +60,16 @@ Mixed shoulder/wrist requests in `solve_configurations` are decomposed together
 in at most two elbow groups. Output order, per-row validity, periodic mapping,
 seed-weighted singular solutions and live joint limits are preserved. This is
 a CPU geometry optimization in both repositories, including exact queries on
-a CUDA-configured Warp solver; global Warp kernels are unchanged.
+a CUDA-configured Warp solver; CUDA global search uses a separate candidate kernel.
+
+Joint-distance weights are normalized before ranking: multiplying all weights
+by the same positive finite factor does not change the selected solution.
+Zero weights retain deterministic input ordering for tied candidates.
+
+CUDA FK, link poses, Jacobians and global IK execute on the caller's current
+PyTorch stream. Warp and Torch share that stream for zero-copy inputs and
+outputs. Sequential calls on different streams join through the solver's Warp
+stream so its cached workspace cannot race the previous call. A solver instance
+is not intended for simultaneous calls from multiple Python threads; use one
+instance per concurrent worker. Returned public outputs own their storage and
+remain valid after subsequent calls, including calls with another batch size.

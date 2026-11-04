@@ -343,3 +343,31 @@ def test_numpy_batch_tcp_matches_warp_with_frames_and_strides(
     reference, actual = ref.get_fk(q), solver.get_fk(q).cpu().numpy()
     assert reference.shape == actual.shape == (count, 4, 4)
     np.testing.assert_allclose(actual, reference, atol=4e-7, rtol=0)
+
+
+@pytest.mark.parametrize("use_warp,device", BACKENDS)
+@pytest.mark.parametrize("scale", [1e-200, 1e200])
+@pytest.mark.parametrize("return_all", [False, True])
+def test_nearest_weight_ranking_ignores_finite_common_scale(
+    use_warp, device, scale, return_all
+):
+    weights = np.array([1.0, 2.0, 0.0, 3.0, 1.0, 0.0, 4.0])
+    outputs = []
+    for multiplier in (1.0, scale):
+        solver = SRSSolver(
+            SRSSolverCfg(num_samples=32, ik_nearest_weight=weights * multiplier),
+            1,
+            device,
+            use_warp=use_warp,
+        )
+        target = solver.get_fk(Q)
+        with np.errstate(over="raise", invalid="raise"):
+            ok, solutions = solver.get_ik(
+                target, Q + 0.2, return_all_solutions=return_all, search_mode="global"
+            )
+        assert bool(ok.all())
+        outputs.append(solutions)
+        np.testing.assert_array_equal(
+            solver.cfg.ik_nearest_weight, weights * multiplier
+        )
+    torch.testing.assert_close(outputs[0], outputs[1], atol=1e-6, rtol=0)
