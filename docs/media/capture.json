@@ -22,10 +22,10 @@
       "frequency_hz": 0.1,
       "joint_speed_bound_rad_s": 2,
       "peak_joint_speed_rad_s": 1.83251291513443,
-      "max_position_error_m": 1.0745380149674383e-7,
-      "max_rotation_error_rad": 4.1842821485099415e-7,
+      "max_position_error_m": 1.0745380149674383e-07,
+      "max_rotation_error_rad": 4.1842821485099415e-07,
       "min_joint_limit_margin_rad": 0.7535431385040283,
-      "loop_closure_max_joint_delta_rad": 1.8477439878150648e-7,
+      "loop_closure_max_joint_delta_rad": 1.8477439878150648e-07,
       "amplitude_deg": 90,
       "observed_offset_deg": [
         -89.98026151273613,
@@ -42,14 +42,22 @@
       "frequency_hz": 0.1,
       "joint_speed_bound_rad_s": 1,
       "peak_joint_speed_rad_s": 0.36326050758361816,
-      "max_position_error_m": 1.4046062361046454e-7,
-      "max_rotation_error_rad": 4.205455121895727e-7,
+      "max_position_error_m": 1.4046062361046454e-07,
+      "max_rotation_error_rad": 4.205455121895727e-07,
       "min_joint_limit_margin_rad": 0.7913627624511719,
-      "loop_closure_max_joint_delta_rad": 1.8477439878150648e-7,
+      "loop_closure_max_joint_delta_rad": 1.8477439878150648e-07,
       "path": "figure-eight",
       "plane": "world-xy",
       "path_size_m": 0.09,
       "accepted_steps": 300
     }
-  ]
+  ],
+  "dependencies": {
+    "numpy": "2.2.6",
+    "viser": "1.0.24",
+    "yourdfpy": "0.0.60",
+    "trimesh": "4.12.2",
+    "torch": "2.13.0+cu130",
+    "warp": "1.16.0"
+  }
 }

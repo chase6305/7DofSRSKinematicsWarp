@@ -19,7 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 viewer = [
     "viser==1.0.24",
-    "yourdfpy==0.0.58",
+    "yourdfpy>=0.0.60",
     "trimesh>=4.0",
 ]
 dev = [

@@ -82,6 +82,12 @@ The reference repository's null-space example also has a batched counterpart:
 srs-null-space-demo --device cuda --backend warp --batch-size 4096 --repeats 20
 ```
 
+The viewer extra pins Viser 1.0.24 and requires yourdfpy 0.0.60 or newer.
+The latter explicitly extracts joint scalars, supporting the conversion rules
+enforced by [NumPy 2.4+](https://numpy.org/doc/stable/release/2.4.0-notes.html#raise-typeerror-on-attempt-to-convert-array-with-ndim-0-to-scalar).
+CI exercises interaction and asset tests on Python 3.10 and 3.12 with viewer
+dependencies installed.
+
 ## Scene controls
 
 The compact panel keeps Play and live TCP error visible. Experiment controls
