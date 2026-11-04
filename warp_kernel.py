@@ -1,4 +1,16 @@
+from functools import partial
+import inspect
+
 import warp as wp
+
+# Compile only the requested kernel and its dependencies, so a first FK call
+# does not also compile the much larger IK kernels. Older Warp releases (1.5)
+# lack this decorator option and retain their original module registration.
+_kernel = (
+    partial(wp.kernel, module="unique")
+    if "module" in inspect.signature(wp.kernel).parameters
+    else wp.kernel
+)
 
 @wp.func
 def identity_mat44() -> wp.mat44:
@@ -101,7 +113,7 @@ def transform_pose(
     return T_b_ob_inv @ target_xpos @ tcp_inv @ T_e_oe_inv
 
 
-@wp.kernel
+@_kernel
 def transform_pose_kernel(
     target_xpos: wp.array(dtype=wp.mat44),
     T_b_ob_inv: wp.mat44,
@@ -294,7 +306,7 @@ def joint_dh_transform(
     )
 
 
-@wp.kernel
+@_kernel
 def compute_fk_kernel(
     joint_angles: wp.array(dtype=float),
     dh_params: wp.array(dtype=float),
@@ -355,7 +367,7 @@ def compute_fk_kernel(
     success[tid] = 1
 
 
-@wp.kernel
+@_kernel
 def compute_fk_chain_kernel(
     joint_angles: wp.array(dtype=float),
     dh_params: wp.array(dtype=float),
@@ -383,7 +395,7 @@ def compute_fk_chain_kernel(
 mat73 = wp.types.matrix(shape=(7, 3), dtype=wp.float32)
 
 
-@wp.kernel
+@_kernel
 def compute_jacobian_kernel(
     joint_angles: wp.array(dtype=float),
     dh_params: wp.array(dtype=float),
@@ -563,7 +575,7 @@ def validate_fk_with_target(
     return 0
 
 
-@wp.kernel
+@_kernel
 def validate_ik_inputs_kernel(
     targets: wp.array(dtype=wp.mat44),
     seeds: wp.array(dtype=float),
@@ -937,7 +949,7 @@ def evaluate_ik_candidate(
         success[tid] = 0  # Mark as failed
 
 
-@wp.kernel
+@_kernel
 def compute_ik_kernel(
     target_xpos_list: wp.array(dtype=wp.mat44),
     angles_list: wp.array(dtype=float),
@@ -979,7 +991,7 @@ def compute_ik_kernel(
     )
 
 
-@wp.kernel
+@_kernel
 def prepare_ik_geometry_kernel(
     target_xpos: wp.array(dtype=wp.mat44),
     T_b_ob_inv: wp.mat44,
@@ -1003,7 +1015,7 @@ def prepare_ik_geometry_kernel(
     geometries[tid] = prepare_ik_geometry(local, elbow, dh_params, link_lengths)
 
 
-@wp.kernel
+@_kernel
 def compute_prepared_ik_kernel(
     target_xpos_list: wp.array(dtype=wp.mat44),
     geometries: wp.array(dtype=IKGeometry),
@@ -1047,7 +1059,7 @@ def compute_prepared_ik_kernel(
     )
 
 
-@wp.kernel
+@_kernel
 def sort_ik_kernel(
     qpos_out: wp.array(dtype=float),  # [N * N_SOL, 7]
     success: wp.array(dtype=int),  # [N * N_SOL]
@@ -1119,7 +1131,7 @@ def sort_ik_kernel(
         sorted_valid[tid * N_SOL + i] = success[src_idx]
 
 
-@wp.kernel
+@_kernel
 def ik_distance_kernel(
     qpos_out: wp.array(dtype=float),
     success: wp.array(dtype=int),
@@ -1160,7 +1172,7 @@ def ik_distance_kernel(
     distances[candidate] = distance
 
 
-@wp.kernel
+@_kernel
 def nearest_ik_kernel(
     qpos_out: wp.array(dtype=float),  # [N * N_SOL * 7]
     success: wp.array(dtype=int),  # [N * N_SOL]
@@ -1210,7 +1222,7 @@ def nearest_ik_kernel(
         nearest_valid[tid] = 0
 
 
-@wp.kernel
+@_kernel
 def check_success_kernel(
     success_wp: wp.array(dtype=int),
     num_solutions: int,

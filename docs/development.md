@@ -229,6 +229,38 @@ CPU compatibility checks include Warp 1.5.0 / NumPy 1.24.4 in CI. Kernel control
 flow uses branches supported by that older compiler; current Warp releases also
 run the full CPU/CUDA suite locally.
 
+## Compile kernels when needed
+
+On Warp versions with unique-module registration, each kernel compiles with
+only its dependencies. A first FK call no longer compiles the unused IK,
+sorting and Jacobian kernels. Older Warp versions without that decorator option
+retain the original registration path. Native FK backward kernels remain
+enabled and covered by the Tape tests above.
+
+A comparison against `b88dec1` used separate processes, empty Warp cache
+directories and disabled CUDA driver caching. Three interleaved trials per
+device produced these medians at 64 targets and 73 arm-angle samples:
+
+| Device | Constructor + first FK, before → after | Through first IK, before → after |
+|:--|--:|--:|
+| CPU | 4.611 → 2.126 s | 4.621 → 3.916 s |
+| CUDA | 20.371 → 2.231 s | 20.421 → 8.738 s |
+
+The first column includes device initialization and FK compilation. The second
+also includes compilation still required by the first global IK call; imports
+and the viewer are excluded. These are startup timings, separate from warmed
+latency. Hardware/compiler/cache behavior affects them. See
+[environment and raw trials](benchmarks/startup.json).
+
+Measure the current implementation without touching existing cache directories:
+
+```bash
+python tools/benchmark_startup.py --device cuda --batch-size 64 --output startup-benchmark.json
+```
+
+The tool uses a temporary Warp cache, disables driver caching only in its own
+process, verifies TCP residuals and also records warmed synchronized IK latency.
+
 ## Viewer startup and branch gallery
 
 The primary robot parses the URDF once. Gallery robots keep independent joint
