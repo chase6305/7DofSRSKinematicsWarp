@@ -3,7 +3,7 @@
 The Warp implementation accelerates a sampled analytical IK solver.
 **It is not a complete reproduction** of Shimizu (2008) or Faria (2018).
 
-The [shared method comparison](https://github.com/chase6305/7DofSRSKinematics/blob/improve/readme-viser-clarity/docs/paper-comparison.md)
+The [shared method comparison](https://github.com/chase6305/7DofSRSKinematics/blob/570787f14e9733643729ee669b5f31aded28aa28/docs/paper-comparison.md)
 maps the reference equations to the NumPy core, identifies missing feasible-interval
 and avoidance policies, and includes a reproducible missed-solution example.
 Both READMEs retain the full paper citations.
@@ -15,6 +15,7 @@ Both READMEs retain the full paper citations.
 | Native Warp search | Enumerates eight S/E/W branches and `cfg.num_samples` uniformly spaced arm angles. Geometry is shared, but no analytical feasible intervals are computed. |
 | Selection | Chooses the sampled candidate nearest the seed using weighted joint distance. `return_all_solutions=True` returns sample slots, not the continuous solution manifold. |
 | Continuous mode | Available in the NumPy CPU fallback. Native Warp supports global sampled search and rejects `search_mode="continuous"`. |
+| Arithmetic | Native kernels and public tensor results use float32. Exact-configuration geometry is evaluated in NumPy float64 before output conversion. |
 | Exact configurations | `solve_configuration` and `solve_configurations` use CPU geometry, including when the solver device is CUDA. |
 | Singular poses | Coupled outer-joint solutions, finite tolerances and full-SVD null-space projection handle selected singular cases. There is no interval-based singularity exclusion or Faria K/α update. |
 
