@@ -346,9 +346,9 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
 
     def _dh_transform(self, d, alpha, a, theta) -> np.ndarray:
         """Build standard DH transforms, broadcasting over joint arrays."""
-        d, alpha, a, theta = np.broadcast_arrays(d, alpha, a, theta)
+        shape = np.broadcast(d, alpha, a, theta).shape
         return self._fill_dh(
-            np.zeros(theta.shape + (4, 4)),
+            np.zeros(shape + (4, 4)),
             d,
             a,
             np.cos(theta),
@@ -383,8 +383,9 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
             yield from transforms
             return
         d, alpha, a, theta = self.dh_params[:stop].T
-        angles = qpos[:, :stop] + theta
-        ct, st = np.cos(angles), np.sin(angles)
+        ct = qpos[:, :stop] + theta
+        st = np.sin(ct)
+        np.cos(ct, out=ct)
         ca, sa = np.cos(alpha), np.sin(alpha)
         transform = np.zeros((len(qpos), 4, 4))
         for index in range(stop):
@@ -678,7 +679,7 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
 
     def _get_fk(self, qpos):
         joints = np.asarray(qpos, dtype=float) * self.rotation_directions_np
-        pose = np.broadcast_to(self.cfg.T_b_ob, joints.shape[:-1] + (4, 4)).copy()
+        pose = np.broadcast_to(self.cfg.T_b_ob, joints.shape[:-1] + (4, 4))
         for transform in self._iter_joint_transforms(joints):
             pose = pose @ transform
         return pose @ self.flange_to_ee
@@ -1416,7 +1417,7 @@ class SRSSolver:
                 )
                 return output
         physical = joints.detach().cpu().numpy() * self.cfg.rotation_directions
-        pose = np.broadcast_to(self.cfg.T_b_ob, (count, 4, 4)).copy()
+        pose = np.broadcast_to(self.cfg.T_b_ob, (count, 4, 4))
         poses = np.empty((count, 8, 4, 4))
         for index, transform in enumerate(self.impl._iter_joint_transforms(physical)):
             pose = pose @ transform
@@ -1465,7 +1466,7 @@ class SRSSolver:
                     )
         else:
             q = joints.detach().cpu().numpy() * self.cfg.rotation_directions
-            pose = np.broadcast_to(self.cfg.T_b_ob, (batch, 4, 4)).copy()
+            pose = np.broadcast_to(self.cfg.T_b_ob, (batch, 4, 4))
             origins, axes = np.empty((batch, 7, 3)), np.empty((batch, 7, 3))
             for index, transform in enumerate(self.impl._iter_joint_transforms(q)):
                 origins[:, index] = pose[:, :3, 3]
