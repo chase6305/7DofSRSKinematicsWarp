@@ -89,6 +89,13 @@ and peak tracked allocations from 5.51 to 2.26 MB against `aff1574`.
 raw trials and allocation scope. These are single-thread CPU measurements,
 including input conversion and output storage, with equal outputs verified.
 
+The same interval-cache comparison uses CPU geometry through the Warp API:
+120 repeated queries, 15 trials and one CPU thread reduced median per-query
+latency from 0.726 to 0.560 ms. Cached and uncached outputs were identical.
+[Interval-query data](benchmarks/interval-query.json) records all trials, residuals
+and the command. This measures the CPU query path, separately from native
+Warp batch throughput.
+
 See [asset provenance](assets.md) for the R800 model. Analytical references:
 [Shimizu et al., 2008](https://doi.org/10.1109/TRO.2008.2003266) and
 [Faria et al., 2018](https://doi.org/10.1016/j.mechmachtheory.2017.10.025).
