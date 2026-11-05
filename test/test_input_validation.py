@@ -70,3 +70,29 @@ def test_optional_seed_and_strided_rigid_inputs(use_warp, device):
     target = target.clone()
     target[0, :3, :3] = torch.eye(3, device=device) * (1 + 2e-7)
     solver.get_ik(target, search_mode="global")
+
+
+@pytest.mark.parametrize("use_warp,device", BACKENDS)
+@pytest.mark.parametrize("magnitude", [1e200, 1e-200])
+def test_extreme_finite_rotation_is_rejected_before_unsafe_matrix_products(
+    use_warp, device, magnitude
+):
+    from srs_solver import SRSConfiguration
+
+    solver = SRSSolver(SRSSolverCfg(), 1, device, use_warp=use_warp)
+    pose = np.eye(4)
+    pose[:3, :3] *= magnitude
+    configuration = SRSConfiguration(1, 1, 1, 0.0)
+    with np.errstate(all="raise"):
+        for operation in (
+            lambda: solver.solve_configuration(pose, configuration, Q),
+            lambda: solver.solve_configurations(pose, [configuration], Q),
+            lambda: solver.set_tcp(pose),
+        ):
+            with pytest.raises(ValueError, match="rigid"):
+                operation()
+        cfg = SRSSolverCfg()
+        cfg.T_b_ob = pose
+        with pytest.raises(ValueError, match="rigid"):
+            SRSSolver(cfg, 1, device, use_warp=use_warp)
+    np.testing.assert_array_equal(solver.get_tcp(), np.eye(4))

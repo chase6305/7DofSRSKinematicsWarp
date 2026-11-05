@@ -92,10 +92,14 @@ def _validate_pose(pose, name="transform", tolerance=1e-6):
     if pose.shape != (4, 4) or not np.all(np.isfinite(pose)):
         raise ValueError(f"{name} must be a finite 4x4 matrix")
     rotation = pose[:3, :3]
+    # Below 1/2, every column squared norm is below 3/4; large values can overflow.
+    scale = np.max(np.abs(rotation))
     if (
-        not np.allclose(pose[3], [0, 0, 0, 1], atol=tolerance, rtol=0)
-        or not np.allclose(rotation.T @ rotation, np.eye(3), atol=tolerance, rtol=0)
-        or not np.isclose(np.linalg.det(rotation), 1, atol=tolerance, rtol=0)
+        (scale < 0.5 and tolerance < 0.25)
+        or scale > 1.0 + tolerance
+        or np.any(np.abs(pose[3] - [0, 0, 0, 1]) > tolerance)
+        or np.any(np.abs(rotation.T @ rotation - np.eye(3)) > tolerance)
+        or abs(np.linalg.det(rotation) - 1.0) > tolerance
     ):
         raise ValueError(f"{name} must be a rigid homogeneous transform")
     return pose
@@ -576,23 +580,30 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
         for first, middle, last, rotation in ((0, 1, 2, r03), (4, 5, 6, r47)):
             singular = np.abs(np.sin(joints[..., middle])) < 1e-6
             if np.any(singular):
+                angles = joints[..., middle]
+                rows = None
+                if np.ndim(singular) and not np.all(singular):
+                    rows = np.flatnonzero(singular)
+                    angles = angles.reshape(-1)[rows]
+                    rotation = rotation.reshape(-1, 3, 3)[rows]
                 d, alpha, a, _ = self.dh_params[first]
                 r1 = self._dh_transform(d, alpha, a, 0.0)[:3, :3]
                 d, alpha, a, _ = self.dh_params[middle]
-                r2 = self._dh_transform(d, alpha, a, joints[..., middle])[..., :3, :3]
+                r2 = self._dh_transform(d, alpha, a, angles)[..., :3, :3]
                 residual = np.swapaxes(r1 @ r2, -1, -2) @ rotation
-                sign = np.where(np.cos(joints[..., middle]) >= 0.0, 1.0, -1.0)
+                sign = np.where(np.cos(angles) >= 0.0, 1.0, -1.0)
                 coupled = sign * np.arctan2(residual[..., 1, 0], residual[..., 0, 0])
                 coupled -= self.dh_params[first, 3] + sign * self.dh_params[last, 3]
                 outer1, outer2 = self._solve_coupled_joints(
                     coupled, sign, first, last, joint_seed
                 )
-                joints[..., first] = np.where(
-                    singular, outer1 + self.dh_params[first, 3], joints[..., first]
-                )
-                joints[..., last] = np.where(
-                    singular, outer2 + self.dh_params[last, 3], joints[..., last]
-                )
+                selected = joints if rows is None else joints.reshape(-1, 7)
+                if rows is None:
+                    selected[..., first] = outer1 + self.dh_params[first, 3]
+                    selected[..., last] = outer2 + self.dh_params[last, 3]
+                else:
+                    selected[rows, first] = outer1 + self.dh_params[first, 3]
+                    selected[rows, last] = outer2 + self.dh_params[last, 3]
         return joints - self.dh_params[:, 3]
 
     def _solve_coupled_joints(self, coupled, sign, first, last, seed):
