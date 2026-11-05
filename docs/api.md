@@ -20,7 +20,8 @@ print(success, qpos)
 Batch conventions:
 
 - Tensor results use float32 on the solver device; success flags use bool.
-  The application's Torch default dtype does not change these types.
+  The application's Torch default dtype or autocast scope does not change these
+  types or reduce the precision of pose validation and null-space projection.
 - `get_fk(qpos)` accepts `(7,)` or `(N, 7)` and returns `(N, 4, 4)`.
 - `get_all_fk_mat(qpos)` accepts the same inputs and returns `(N, 8, 4, 4)`:
   seven world-frame DH link poses followed by the TCP, computed in one chain
@@ -60,6 +61,7 @@ iiwa 7 R800 geometry, URDF path and joint limits directly.
 - Both backends map periodic joint representations to the limits nearest the seed. At shoulder/wrist singularities, both outer joints are optimized together using the configured weights and joint limits.
 - `solve_configuration(target, configuration, joint_seed=None)` accepts an optional seed for periodic and singular solutions. Branch signs use physical angles, including DH offsets and reversed joint directions.
 - Joint weights must be finite and non-negative; rotation directions must be `-1` or `1`; sampling requires an integer of at least two. Pose inputs must be rigid homogeneous transforms. Explicit zero-width limits are retained.
+- Workspace checks allow float32 rounding at full extension; returned solutions still pass FK residual checks.
 - Empty batches return empty outputs of the documented shapes. Importing the library does not configure application logging.
 - Reversed NumPy slices such as `q[::-1]` and `q[:, ::-1]` are accepted. Views with negative strides are copied before tensor conversion, including joint states, IK targets/seeds and TCP transforms.
 - Wheels include the URDF and all visual/collision meshes; the solver, viewer and demo resolve installed resources outside the source checkout.

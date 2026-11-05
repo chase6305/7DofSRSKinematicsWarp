@@ -307,11 +307,59 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
             -np.pi, np.pi, self.cfg.num_samples, endpoint=False
         )
 
+    def _validate_inputs(self, target_xpos, qpos_seed):
+        """Keep rigid-pose checks in float32 inside an application autocast scope."""
+        with torch.autocast(device_type=self.device.type, enabled=False):
+            if not bool(torch.isfinite(target_xpos).all()):
+                raise ValueError("target_xpos must contain only finite values")
+            rotation = target_xpos[:, :3, :3]
+            identity = torch.eye(3, dtype=target_xpos.dtype, device=self.device)
+            bottom = torch.tensor(
+                [0, 0, 0, 1], dtype=target_xpos.dtype, device=self.device
+            )
+            if (
+                not torch.allclose(
+                    target_xpos[:, 3],
+                    bottom,
+                    atol=1e-6,
+                    rtol=0,
+                )
+                or not torch.allclose(
+                    rotation.transpose(1, 2) @ rotation,
+                    identity,
+                    atol=1e-6,
+                    rtol=0,
+                )
+                or not torch.allclose(
+                    torch.linalg.det(rotation),
+                    target_xpos.new_tensor(1.0),
+                    atol=1e-6,
+                    rtol=0,
+                )
+            ):
+                raise ValueError(
+                    "target_xpos must contain rigid homogeneous transforms"
+                )
+            if qpos_seed is not None:
+                if not bool(torch.isfinite(qpos_seed).all()):
+                    raise ValueError("qpos_seed must contain only finite values")
+
     def _dh_transform(self, d, alpha, a, theta) -> np.ndarray:
         """Build standard DH transforms, broadcasting over joint arrays."""
         d, alpha, a, theta = np.broadcast_arrays(d, alpha, a, theta)
-        ct, st, ca, sa = np.cos(theta), np.sin(theta), np.cos(alpha), np.sin(alpha)
-        transforms = np.zeros(theta.shape + (4, 4))
+        return self._fill_dh(
+            np.zeros(theta.shape + (4, 4)),
+            d,
+            a,
+            np.cos(theta),
+            np.sin(theta),
+            np.cos(alpha),
+            np.sin(alpha),
+        )
+
+    @staticmethod
+    def _fill_dh(transforms, d, a, ct, st, ca, sa):
+        """Fill DH entries in zeroed output storage."""
         transforms[..., 0, 0] = ct
         transforms[..., 0, 1] = -st * ca
         transforms[..., 0, 2] = st * sa
@@ -326,6 +374,30 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
         transforms[..., 3, 3] = 1.0
         return transforms
 
+    def _iter_joint_transforms(self, qpos, stop=7):
+        """Yield joint transforms; large batches reuse one matrix buffer."""
+        if qpos.ndim != 2 or len(qpos) < 256:
+            transforms = self._joint_transforms(qpos, stop)
+            if qpos.ndim > 1:
+                transforms = np.moveaxis(transforms, -3, 0)
+            yield from transforms
+            return
+        d, alpha, a, theta = self.dh_params[:stop].T
+        angles = qpos[:, :stop] + theta
+        ct, st = np.cos(angles), np.sin(angles)
+        ca, sa = np.cos(alpha), np.sin(alpha)
+        transform = np.zeros((len(qpos), 4, 4))
+        for index in range(stop):
+            yield self._fill_dh(
+                transform,
+                d[index],
+                a[index],
+                ct[:, index],
+                st[:, index],
+                ca[index],
+                sa[index],
+            )
+
     def _joint_transforms(self, qpos, stop=7):
         d, alpha, a, theta = self.dh_params[:stop].T
         return self._dh_transform(d, alpha, a, theta + qpos[..., :stop])
@@ -339,14 +411,7 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
         return poses
 
     def _configuration(self, rconf: int) -> tuple:
-        r"""Determine the configuration of the arm, elbow, and wrist based on a configuration integer.
-
-        Args:
-            rconf (int): The configuration integer.
-
-        Returns:
-            tuple: A tuple containing the configurations of the arm, elbow, and wrist.
-        """
+        """Decode shoulder, elbow and wrist signs from the three branch bits."""
         arm_config = -1 if rconf & 1 else 1
         elbow_config = -1 if rconf & 2 else 1
         wrist_config = -1 if rconf & 4 else 1
@@ -354,14 +419,7 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
 
     @staticmethod
     def skew(vector: np.ndarray) -> np.ndarray:
-        r"""Compute the skew-symmetric matrix of a vector.
-
-        Args:
-            vector (np.ndarray): A 3D vector.
-
-        Returns:
-            np.ndarray: The skew-symmetric matrix of the input vector.
-        """
+        """Return the cross-product matrix of a three-vector."""
         return np.array(
             [
                 [0, -vector[2], vector[1]],
@@ -373,15 +431,7 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
     def _calculate_joint_angles(
         self, P_s_to_w: np.ndarray, elbow_GC4: int
     ) -> typing.Tuple[bool, typing.Optional[np.ndarray]]:
-        r"""Calculate joint angles based on the position from shoulder to wrist and elbow configuration.
-
-        Args:
-            P_s_to_w (np.ndarray): The position vector from shoulder to wrist.
-            elbow_GC4 (int): The elbow configuration parameter.
-
-        Returns:
-            np.ndarray: A boolean indicating success and an array of joint angles.
-        """
+        """Build reference shoulder/elbow angles for a reachable wrist centre."""
         d_se, d_ew = self.link_lengths[1:3]
         joints = np.zeros(7)
 
@@ -389,13 +439,15 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
         norm_P26 = np.linalg.norm(P_s_to_w)
         if norm_P26 < 1e-12:
             return False, None
-        if not (
-            d_se + d_ew + 1e-10 >= norm_P26 and norm_P26 + 1e-10 >= abs(d_se - d_ew)
-        ):
+        # Float32 pose rounding can put full extension just outside the triangle.
+        # Returned solutions still have to pass the FK residual checks.
+        if not (d_se + d_ew + 1e-6 >= norm_P26 and norm_P26 + 1e-6 >= abs(d_se - d_ew)):
             logger.debug("Specified pose outside reachable workspace.")
             return False, None
 
         elbow_cos_angle = (norm_P26**2 - d_se**2 - d_ew**2) / (2 * d_se * d_ew)
+        if abs(elbow_cos_angle) > 1.0 + 1e-6:
+            return False, None
 
         joints[3] = elbow_GC4 * np.arccos(np.clip(elbow_cos_angle, -1.0, 1.0))
 
@@ -626,10 +678,9 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
 
     def _get_fk(self, qpos):
         joints = np.asarray(qpos, dtype=float) * self.rotation_directions_np
-        transforms = self._joint_transforms(joints)
         pose = np.broadcast_to(self.cfg.T_b_ob, joints.shape[:-1] + (4, 4)).copy()
-        for index in range(7):
-            pose = pose @ transforms[..., index, :, :]
+        for transform in self._iter_joint_transforms(joints):
+            pose = pose @ transform
         return pose @ self.flange_to_ee
 
     def _local_target(self, target):
@@ -1365,16 +1416,13 @@ class SRSSolver:
                 )
                 return output
         physical = joints.detach().cpu().numpy() * self.cfg.rotation_directions
-        transforms = self.impl._joint_transforms(physical)
         pose = np.broadcast_to(self.cfg.T_b_ob, (count, 4, 4)).copy()
-        poses = []
-        for index in range(7):
-            pose = pose @ transforms[:, index]
-            poses.append(pose)
-        poses.append(pose @ self.cfg.T_e_oe @ self.cfg.tcp)
-        return _as_tensor(
-            np.stack(poses, axis=1), dtype=joints.dtype, device=self.device
-        )
+        poses = np.empty((count, 8, 4, 4))
+        for index, transform in enumerate(self.impl._iter_joint_transforms(physical)):
+            pose = pose @ transform
+            poses[:, index] = pose
+        poses[:, 7] = pose @ self.cfg.T_e_oe @ self.cfg.tcp
+        return _as_tensor(poses, dtype=joints.dtype, device=self.device)
 
     def get_jacobian(
         self, qpos: np.ndarray | torch.Tensor, step: float = 1e-4
@@ -1417,17 +1465,17 @@ class SRSSolver:
                     )
         else:
             q = joints.detach().cpu().numpy() * self.cfg.rotation_directions
-            transforms = self.impl._joint_transforms(q)
             pose = np.broadcast_to(self.cfg.T_b_ob, (batch, 4, 4)).copy()
-            origins, axes = [], []
-            for index in range(7):
-                origins.append(pose[:, :3, 3])
-                axes.append(pose[:, :3, 2] * self.cfg.rotation_directions[index])
-                pose = pose @ transforms[:, index]
+            origins, axes = np.empty((batch, 7, 3)), np.empty((batch, 7, 3))
+            for index, transform in enumerate(self.impl._iter_joint_transforms(q)):
+                origins[:, index] = pose[:, :3, 3]
+                axes[:, index] = pose[:, :3, 2] * self.cfg.rotation_directions[index]
+                pose = pose @ transform
             tcp = (pose @ self.cfg.T_e_oe @ self.cfg.tcp)[:, :3, 3]
-            axes = np.stack(axes, axis=1)
-            linear = np.cross(axes, tcp[:, None] - np.stack(origins, axis=1))
-            jacobian = np.concatenate((linear, axes), axis=-1).transpose(0, 2, 1)
+            linear = np.cross(axes, tcp[:, None] - origins)
+            jacobian = np.empty((batch, 6, 7))
+            jacobian[:, :3] = linear.transpose(0, 2, 1)
+            jacobian[:, 3:] = axes.transpose(0, 2, 1)
             output = _as_tensor(jacobian, dtype=joints.dtype, device=self.device)
         return output[0] if squeeze else output
 
@@ -1460,9 +1508,10 @@ class SRSSolver:
             (singular <= cutoff, torch.ones_like(singular[:, :1], dtype=torch.bool)),
             dim=1,
         )
-        coefficients = (vh @ preferred.unsqueeze(-1)).squeeze(-1)
+        # Elementwise reductions preserve float32 inside the caller's autocast scope.
+        coefficients = (vh * preferred[:, None, :]).sum(dim=2)
         coefficients = coefficients.masked_fill(~null, 0.0)
-        velocity = (vh.transpose(1, 2) @ coefficients.unsqueeze(-1)).squeeze(-1)
+        velocity = (vh * coefficients[:, :, None]).sum(dim=1)
         return velocity[0] if squeeze else velocity
 
     def get_null_space_direction(self, qpos: np.ndarray | torch.Tensor) -> torch.Tensor:
@@ -1527,42 +1576,7 @@ class SRSSolver:
                 0, dtype=torch.bool, device=self.device
             ), target_xpos.new_empty((0, slots, 7))
         with _torch_stream(self.device):
-            if self.use_warp:
-                self.impl._validate_inputs(target_xpos, qpos_seed)
-            else:
-                if not bool(torch.isfinite(target_xpos).all()):
-                    raise ValueError("target_xpos must contain only finite values")
-                rotation = target_xpos[:, :3, :3]
-                identity = torch.eye(3, dtype=target_xpos.dtype, device=self.device)
-                bottom = torch.tensor(
-                    [0, 0, 0, 1], dtype=target_xpos.dtype, device=self.device
-                )
-                if (
-                    not torch.allclose(
-                        target_xpos[:, 3],
-                        bottom.expand(target_xpos.shape[0], -1),
-                        atol=1e-6,
-                        rtol=0,
-                    )
-                    or not torch.allclose(
-                        rotation.transpose(1, 2) @ rotation,
-                        identity.expand(target_xpos.shape[0], -1, -1),
-                        atol=1e-6,
-                        rtol=0,
-                    )
-                    or not torch.allclose(
-                        torch.linalg.det(rotation),
-                        target_xpos.new_ones(target_xpos.shape[0]),
-                        atol=1e-6,
-                        rtol=0,
-                    )
-                ):
-                    raise ValueError(
-                        "target_xpos must contain rigid homogeneous transforms"
-                    )
-                if qpos_seed is not None:
-                    if not bool(torch.isfinite(qpos_seed).all()):
-                        raise ValueError("qpos_seed must contain only finite values")
+            self.impl._validate_inputs(target_xpos, qpos_seed)
             return self.impl.get_ik(
                 target_xpos=target_xpos.contiguous(),
                 qpos_seed=qpos_seed,

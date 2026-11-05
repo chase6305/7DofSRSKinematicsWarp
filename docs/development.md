@@ -34,6 +34,10 @@ intermediates for Warp Tape gradients. Null-space velocity uses a full SVD to
 preserve extra null directions at singular poses. Modern Warp versions compile
 kernels separately; Warp 1.5 retains the compatible module registration path.
 
+The NumPy CPU fallback reuses one DH matrix buffer for batches of at least 256
+robots and preallocates link poses and Jacobian storage; small batches retain
+eager DH evaluation.
+
 ## Reproduce benchmarks
 
 ```bash
@@ -71,6 +75,12 @@ The shared viewer also reduced first gallery opening from 545 to 254 ms in the
 NumPy-backend comparison recorded in [viewer data](benchmarks/viewer.json).
 That measures IK and server construction, excluding initial app construction,
 network, browser and WebGL; it is separate from CUDA solver throughput.
+
+For 4096 CPU fallback robots, complete FK calls changed from 1.636 to 1.210 ms
+and peak tracked allocations from 5.51 to 2.49 MB against `aff1574`.
+[Batch-chain data](benchmarks/batch-chain.json) includes link poses, Jacobians,
+raw trials and allocation scope. These are single-thread CPU measurements,
+including input conversion and output storage, with equal outputs verified.
 
 See [asset provenance](assets.md) for the R800 model. Analytical references:
 [Shimizu et al., 2008](https://doi.org/10.1109/TRO.2008.2003266) and

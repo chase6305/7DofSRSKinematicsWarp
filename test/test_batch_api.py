@@ -10,7 +10,8 @@ from srs_solver import KUKAiiwaSolver, SRSConfiguration, SRSSolver, SRSSolverCfg
     [(False, "cpu"), (True, "cpu")]
     + ([(True, "cuda")] if torch.cuda.is_available() else []),
 )
-def test_ik_is_independent_of_torch_default_dtype(use_warp, device):
+@pytest.mark.parametrize("autocast", [False, True])
+def test_ik_is_independent_of_torch_default_dtype(use_warp, device, autocast):
     previous = torch.get_default_dtype()
     try:
         torch.set_default_dtype(torch.float64)
@@ -26,9 +27,10 @@ def test_ik_is_independent_of_torch_default_dtype(use_warp, device):
 
         joints = torch.tensor([[0.3, -0.5, 0.7, 1.0, -0.4, 0.8, -0.2]])
         target = solver.get_fk(joints)
-        success, solution = solver.get_ik(
-            target.double(), joints + 0.02, search_mode="global"
-        )
+        with torch.autocast(device_type=device, enabled=autocast):
+            success, solution = solver.get_ik(
+                target.double(), joints + 0.02, search_mode="global"
+            )
         assert bool(success.all()) and solution.dtype == torch.float32
         torch.testing.assert_close(
             solver.get_fk(solution[:, 0]), target, atol=1e-4, rtol=0
@@ -111,6 +113,21 @@ def test_stationary_seed_fast_path_and_failure_shapes():
     success, solutions = solver.get_ik(unreachable, zero, return_all_solutions=True)
     assert success.tolist() == [False]
     assert solutions.shape == (1, 8 * solver.cfg.num_samples, 7)
+
+
+@pytest.mark.parametrize(
+    "use_warp,device",
+    [(False, "cpu"), (True, "cpu")]
+    + ([(True, "cuda")] if torch.cuda.is_available() else []),
+)
+def test_quantized_fully_extended_fk_target_can_be_solved(use_warp, device):
+    solver = SRSSolver(SRSSolverCfg(num_samples=73), 1, device, use_warp)
+    q = torch.zeros((1, 7), device=device)
+    target = solver.get_fk(q)
+    success, solution = solver.get_ik(target, q + 0.02, search_mode="global")
+    assert bool(success.all())
+    actual = solver.get_fk(solution[:, 0])
+    torch.testing.assert_close(actual, target, atol=2e-6, rtol=0)
 
 
 def test_kuka_convenience_solver():
