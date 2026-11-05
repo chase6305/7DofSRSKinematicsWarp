@@ -41,26 +41,7 @@ def suppress_native_output():
 def build_solver_cfg() -> SRSSolverCfg:
     from srs_solver import SRSSolverCfg
 
-    cfg = SRSSolverCfg()
-    cfg.dh_params = np.array(
-        [
-            [0.34, -np.pi / 2.0, 0.0, 0.0],
-            [0.0, np.pi / 2.0, 0.0, 0.0],
-            [0.4, np.pi / 2.0, 0.0, 0.0],
-            [0.0, -np.pi / 2.0, 0.0, 0.0],
-            [0.4, -np.pi / 2.0, 0.0, 0.0],
-            [0.0, np.pi / 2.0, 0.0, 0.0],
-            [0.126, 0.0, 0.0, 0.0],
-        ],
-        dtype=np.float64,
-    )
-    cfg.link_lengths = np.array([0.34, 0.4, 0.4, 0.126], dtype=np.float64)
-    cfg.rotation_directions = [1, 1, 1, 1, 1, 1, 1]
-    cfg.T_b_ob = np.eye(4)
-    cfg.T_e_oe = np.eye(4)
-    cfg.num_samples = 300
-    cfg.sort_ik = True
-    cfg.ik_nearest_weight = [1, 1, 1, 1, 1, 1, 1]
+    cfg = SRSSolverCfg(num_samples=300)
     cfg.joint_names = [f"joint{i + 1}" for i in range(7)]
     cfg.urdf_path = get_iiwa_urdf_path()
     return cfg
