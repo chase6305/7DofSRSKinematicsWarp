@@ -143,10 +143,13 @@ def test_empty_strided_and_invalid_batches(use_warp, device):
 
 
 @pytest.mark.parametrize("use_warp,device", BACKENDS)
-def test_batched_link_poses_with_frames_offsets_and_strides(use_warp, device):
+@pytest.mark.parametrize("count", [2, 257])
+def test_batched_link_poses_with_frames_offsets_and_strides(use_warp, device, count):
     cfg = SRSSolverCfg()
     cfg.rotation_directions = np.array([-1, 1, -1, 1, -1, 1, -1])
     cfg.dh_params[:, 3] = np.linspace(-0.15, 0.15, 7)
+    cfg.dh_params[:, 1] += np.linspace(-0.07, 0.07, 7)
+    cfg.dh_params[:, 2] = np.linspace(0.01, 0.03, 7)
     cfg.T_b_ob[:3, :3] = [[0, -1, 0], [1, 0, 0], [0, 0, 1]]
     cfg.T_b_ob[:3, 3] = [0.3, -0.1, 0.2]
     cfg.T_e_oe[:3, :3] = [[1, 0, 0], [0, 0, -1], [0, 1, 0]]
@@ -155,12 +158,13 @@ def test_batched_link_poses_with_frames_offsets_and_strides(use_warp, device):
     tcp = np.eye(4)
     tcp[:3, 3] = [0.06, -0.02, 0.08]
     solver.set_tcp(tcp)
-    joints = torch.tensor(np.array([Q, Q, -Q, -Q]), dtype=torch.float32, device=device)[
-        ::2
-    ]
+    values = np.tile(np.array([Q, Q, -Q, -Q]), ((count + 1) // 2, 1))[: count * 2]
+    joints = torch.tensor(values, dtype=torch.float32, device=device)[::2]
     assert not joints.is_contiguous()
     actual = solver.get_all_fk_mat(joints)
-    assert actual.shape == (2, 8, 4, 4)
+    assert actual.shape == (count, 8, 4, 4)
+    jacobian = solver.get_jacobian(joints)
+    assert jacobian.shape == (count, 6, 7) and jacobian.is_contiguous()
     for row, q in enumerate(joints.cpu().numpy()):
         pose = cfg.T_b_ob.copy()
         expected = []
@@ -323,7 +327,7 @@ def test_bundled_assets_and_demo_model_paths():
 
 
 @pytest.mark.parametrize("use_warp,device", BACKENDS)
-@pytest.mark.parametrize("count", [0, 1, 17])
+@pytest.mark.parametrize("count", [0, 1, 17, 256, 257])
 def test_numpy_batch_tcp_matches_warp_with_frames_and_strides(
     reference_class, use_warp, device, count
 ):
@@ -343,3 +347,60 @@ def test_numpy_batch_tcp_matches_warp_with_frames_and_strides(
     reference, actual = ref.get_fk(q), solver.get_fk(q).cpu().numpy()
     assert reference.shape == actual.shape == (count, 4, 4)
     np.testing.assert_allclose(actual, reference, atol=4e-7, rtol=0)
+
+
+@pytest.mark.parametrize("use_warp,device", BACKENDS)
+@pytest.mark.parametrize("scale", [1e-200, 1e200])
+@pytest.mark.parametrize("return_all", [False, True])
+def test_nearest_weight_ranking_ignores_finite_common_scale(
+    use_warp, device, scale, return_all
+):
+    weights = np.array([1.0, 2.0, 0.0, 3.0, 1.0, 0.0, 4.0])
+    outputs = []
+    for multiplier in (1.0, scale):
+        solver = SRSSolver(
+            SRSSolverCfg(num_samples=32, ik_nearest_weight=weights * multiplier),
+            1,
+            device,
+            use_warp=use_warp,
+        )
+        target = solver.get_fk(Q)
+        with np.errstate(over="raise", invalid="raise"):
+            ok, solutions = solver.get_ik(
+                target, Q + 0.2, return_all_solutions=return_all, search_mode="global"
+            )
+        assert bool(ok.all())
+        outputs.append(solutions)
+        np.testing.assert_array_equal(
+            solver.cfg.ik_nearest_weight, weights * multiplier
+        )
+    torch.testing.assert_close(outputs[0], outputs[1], atol=1e-6, rtol=0)
+
+
+@pytest.mark.parametrize("use_warp,device", BACKENDS)
+@pytest.mark.parametrize("autocast", [False, True])
+def test_null_space_projection_properties_and_empty_batches(use_warp, device, autocast):
+    solver = make_solver(use_warp, device)
+    near_straight = Q.copy()
+    near_straight[3] = 1e-4
+    joints = np.array([Q, -Q, np.zeros(7), near_straight])
+    preferred = torch.linspace(-0.7, 0.9, 28, device=device).reshape(4, 7)
+    preserved = preferred.clone()
+    with torch.autocast(device_type=device, enabled=autocast):
+        projected = solver.get_null_space_velocity(joints, preferred)
+    jacobian = solver.get_jacobian(joints)
+    assert projected.shape == (4, 7)
+    assert projected.dtype == torch.float32
+    assert float(torch.linalg.vector_norm(jacobian @ projected[..., None])) < 1e-5
+    with torch.autocast(device_type=device, enabled=autocast):
+        repeated = solver.get_null_space_velocity(joints, projected)
+    torch.testing.assert_close(repeated, projected, atol=2e-6, rtol=0)
+    assert bool(
+        (
+            torch.linalg.vector_norm(projected, dim=1)
+            <= torch.linalg.vector_norm(preferred, dim=1) + 2e-6
+        ).all()
+    )
+    torch.testing.assert_close(preferred, preserved)
+    empty = solver.get_null_space_velocity(np.empty((0, 7)), np.empty((0, 7)))
+    assert empty.shape == (0, 7)

@@ -1,23 +1,8 @@
-"""Standalone single-arm Viser viewer for the KUKA iiwa 7-DOF model.
-
-This script runs a single built-in sinusoidal trajectory mode:
-
-- loads the single-arm URDF in this repository
-- animates all joints continuously in one main loop
-- updates a TCP frame from the URDF FK so pose stays consistent with the arm
-
-Dependencies:
-- viser==1.0.24
-- yourdfpy==0.0.58
-
-Run:
-        python viser_viewer.py
-"""
+"""Minimal URDF viewer used by the single-arm trajectory example."""
 
 from __future__ import annotations
 
 import argparse
-import importlib
 import time
 from pathlib import Path
 
@@ -26,25 +11,22 @@ import numpy as np
 
 class SingleArmViserViewer:
     def __init__(self, urdf_path: Path, host: str, port: int) -> None:
-        np.set_printoptions(precision=5, suppress=True, linewidth=160)
-
         try:
-            viser = importlib.import_module("viser")
-            yourdfpy = importlib.import_module("yourdfpy")
-            ViserUrdf = importlib.import_module("viser.extras").ViserUrdf
-        except Exception as exc:
+            import viser
+            import yourdfpy
+            from viser.extras import ViserUrdf
+        except ImportError as exc:
             raise ImportError(
-                "Missing dependencies. Install viser and yourdfpy before running this viewer."
+                "Install the viewer extra: pip install -e '.[viewer]'"
             ) from exc
 
-        self._viser = viser
-        self._yourdfpy = yourdfpy
-        self._ViserUrdf = ViserUrdf
         self.host = host
         self.port = port
 
         self.urdf_path = urdf_path.resolve()
         self.server = viser.ViserServer(host=host, port=port)
+        self.port = self.server.get_port()
+        self.closed = False
 
         self.robot_model = yourdfpy.URDF.load(str(self.urdf_path))
         self.viser_robot = ViserUrdf(
@@ -54,13 +36,6 @@ class SingleArmViserViewer:
         )
 
         self.joint_names = list(self.viser_robot.get_actuated_joint_names())
-
-        self.end_effector_link_name = self.robot_model.joint_map[
-            self.joint_names[-1]
-        ].child
-        self.end_effector_link = self.robot_model.link_map.get(
-            self.end_effector_link_name
-        )
 
         self.q = np.zeros(len(self.joint_names), dtype=np.float64)
         self.viser_robot.update_cfg(self.q)
@@ -90,6 +65,17 @@ class SingleArmViserViewer:
                 time.sleep(1.0)
         except KeyboardInterrupt:
             pass
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        if not self.closed:
+            try:
+                self.server.stop()
+            except RuntimeError as error:
+                if str(error) != "Event loop is closed":
+                    raise
+            self.closed = True
 
 
 def _parse_args() -> argparse.Namespace:
@@ -108,10 +94,6 @@ def _parse_args() -> argparse.Namespace:
         "--host", type=str, default="127.0.0.1", help="Viser server host."
     )
     parser.add_argument("--port", type=int, default=8080, help="Viser server port.")
-    parser.add_argument(
-        "--hz", type=float, default=60.0, help="Trajectory update rate in Hz."
-    )
-
     return parser.parse_args()
 
 

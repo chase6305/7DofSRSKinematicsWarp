@@ -13,18 +13,16 @@ dependencies = [
     "numpy>=1.24",
     "torch>=2.1",
     "warp-lang>=1.5",
-    "coloredlogs>=15.0",
 ]
 
 [project.optional-dependencies]
 viewer = [
     "viser==1.0.24",
-    "yourdfpy==0.0.58",
+    "yourdfpy>=0.0.60",
     "trimesh>=4.0",
 ]
 dev = [
     "pytest>=8.0",
-    "ipython>=8.0",
 ]
 
 [project.scripts]
@@ -35,6 +33,7 @@ srs-null-space-demo = "example.parallel_null_space_demo:main"
 srs-warp-lab = "srs_warp_viser.app:main"
 
 [tool.setuptools]
+include-package-data = false
 py-modules = ["srs_solver", "warp_kernel", "viser_viewer"]
 packages = ["example", "srs_kinematics_warp_assets", "srs_warp_viser"]
 
@@ -42,7 +41,7 @@ packages = ["example", "srs_kinematics_warp_assets", "srs_warp_viser"]
 srs_kinematics_warp_assets = "urdf"
 
 [tool.setuptools.package-data]
-srs_kinematics_warp_assets = ["*.urdf", "meshes/*.dae", "meshes/*.stl"]
+srs_kinematics_warp_assets = ["*.urdf", "README.md", "ASSET_LICENSE", "visual/*.glb", "collision/*.stl"]
 
 [tool.pytest.ini_options]
 testpaths = ["test"]

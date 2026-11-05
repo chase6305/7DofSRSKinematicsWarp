@@ -1,0 +1,120 @@
+{
+  "gpu": "NVIDIA GeForce RTX 5090 D v2",
+  "batches": [
+    {
+      "device": "cpu",
+      "batch": 1,
+      "before_ms": 0.568595,
+      "after_ms": 0.420365,
+      "max_joint_delta_rad": 0.0,
+      "bit_identical_rows": 1,
+      "valid": 1,
+      "before_workspace_bytes": 21088,
+      "after_workspace_bytes": 21536
+    },
+    {
+      "device": "cpu",
+      "batch": 16,
+      "before_ms": 4.731519,
+      "after_ms": 3.518735,
+      "max_joint_delta_rad": 0.0,
+      "bit_identical_rows": 16,
+      "valid": 16,
+      "before_workspace_bytes": 337408,
+      "after_workspace_bytes": 344576
+    },
+    {
+      "device": "cpu",
+      "batch": 64,
+      "before_ms": 13.490534,
+      "after_ms": 10.181165,
+      "max_joint_delta_rad": 0.0,
+      "bit_identical_rows": 64,
+      "valid": 64,
+      "before_workspace_bytes": 1349632,
+      "after_workspace_bytes": 1378304
+    },
+    {
+      "device": "cuda",
+      "batch": 1,
+      "before_ms": 0.600536,
+      "after_ms": 0.248951,
+      "max_joint_delta_rad": 0.0,
+      "bit_identical_rows": 1,
+      "valid": 1,
+      "before_workspace_bytes": 21088,
+      "after_workspace_bytes": 21536
+    },
+    {
+      "device": "cuda",
+      "batch": 16,
+      "before_ms": 0.583314,
+      "after_ms": 0.249872,
+      "max_joint_delta_rad": 0.0,
+      "bit_identical_rows": 16,
+      "valid": 16,
+      "before_workspace_bytes": 337408,
+      "after_workspace_bytes": 344576
+    },
+    {
+      "device": "cuda",
+      "batch": 64,
+      "before_ms": 0.594194,
+      "after_ms": 0.244833,
+      "max_joint_delta_rad": 0.0,
+      "bit_identical_rows": 64,
+      "valid": 64,
+      "before_workspace_bytes": 1349632,
+      "after_workspace_bytes": 1378304
+    },
+    {
+      "device": "cuda",
+      "batch": 128,
+      "before_ms": 0.587821,
+      "after_ms": 0.251295,
+      "max_joint_delta_rad": 0.0,
+      "bit_identical_rows": 128,
+      "valid": 128,
+      "before_workspace_bytes": 2699264,
+      "after_workspace_bytes": 2756608
+    },
+    {
+      "device": "cuda",
+      "batch": 1024,
+      "before_ms": 0.774354,
+      "after_ms": 0.330846,
+      "max_joint_delta_rad": 0.0,
+      "bit_identical_rows": 1024,
+      "valid": 1024,
+      "before_workspace_bytes": 21594112,
+      "after_workspace_bytes": 22052864
+    },
+    {
+      "device": "cuda",
+      "batch": 4096,
+      "before_ms": 0.961769,
+      "after_ms": 0.479808,
+      "max_joint_delta_rad": 0.0,
+      "bit_identical_rows": 4096,
+      "valid": 4096,
+      "before_workspace_bytes": 86376448,
+      "after_workspace_bytes": 88211456
+    }
+  ],
+  "date_utc": "2026-11-04",
+  "before_commit": "8472c8b3590fcd38e379e7be0195651a74d774e2",
+  "environment": {
+    "python": "3.10.0",
+    "numpy": "2.2.6",
+    "torch": "2.13.0",
+    "warp-lang": "1.16.0",
+    "viser": "1.0.24",
+    "yourdfpy": "0.0.60",
+    "trimesh": "4.12.2"
+  },
+  "warmup_calls": 5,
+  "interleaved_repeats": 21,
+  "num_samples": 73,
+  "seed_offset_rad": 0.02,
+  "scope": "Complete get_ik call with input validation, geometry preparation, candidate scoring and result selection. CUDA calls synchronize before measuring elapsed time. Compilation and viewer excluded."
+}

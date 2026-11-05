@@ -1,4 +1,3 @@
-# 日志设置
 import logging
 import tempfile
 import typing
@@ -9,14 +8,14 @@ import numpy as np
 import torch
 import warp as wp
 from warp_kernel import (
-    check_success_kernel,
+    IKGeometry,
     compute_fk_chain_kernel,
     compute_fk_kernel,
-    compute_ik_kernel,
+    compute_prepared_ik_kernel,
     compute_jacobian_kernel,
-    nearest_ik_kernel,
-    sort_ik_kernel,
-    transform_pose_kernel,
+    ik_distance_kernel,
+    prepare_ik_geometry_kernel,
+    validate_ik_inputs_kernel,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,24 +49,42 @@ def _ensure_writable_warp_cache() -> None:
         wp.config.kernel_cache_dir = str(fallback)
 
 
+def _resolve_device(device: str | torch.device) -> torch.device:
+    """Keep Torch and Warp on the same concrete device for the solver lifetime."""
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    if device.type == "cpu":
+        return torch.device("cpu")
+    return device
+
+
 def standardize_device_string(device: str | torch.device) -> str:
-    """Standardize the device string for Warp compatibility.
+    """Resolve Torch aliases, including the current unindexed CUDA device."""
+    return str(_resolve_device(device))
 
-    Args:
-        device (Union[str, torch.device]): The device specification.
 
-    Returns:
-        str: The standardized device string.
+def _torch_stream(device: torch.device):
+    """Order shared Torch/Warp buffers on the caller's current CUDA stream.
+
+    Join back to Warp's previous stream on exit so cached workspaces and Warp
+    allocations remain ordered when the next call uses a different Torch stream.
+    CPU execution needs no stream conversion.
     """
-    if isinstance(device, str):
-        device_str = device
-    else:
-        device_str = str(device)
+    stream = wp.stream_from_torch(device) if device.type == "cuda" else None
+    return wp.ScopedStream(stream, sync_exit=True)
 
-    if device_str == "cuda":
-        device_str = "cuda:0"
 
-    return device_str
+def _as_tensor(value, *args, **kwargs):
+    """Accept reversed NumPy views that Torch cannot wrap directly."""
+    if isinstance(value, np.ndarray) and any(stride < 0 for stride in value.strides):
+        value = value.copy()
+    return torch.as_tensor(value, *args, **kwargs)
+
+
+def _torch_view(array):
+    """Share Warp storage through DLPack with explicit array ownership."""
+    return torch.from_dlpack(wp.to_dlpack(array))
 
 
 def _validate_pose(pose, name="transform", tolerance=1e-6):
@@ -107,65 +124,23 @@ class ArmKineParams:
     qpos_limits: np.ndarray = field(init=False)
 
     def __post_init__(self):
-        # self.d_list = np.array([0.0, 0.0, 0.260, 0.0, 0.166, 0.098, 0.0])
         self.link_lengths = np.array([0.34, 0.4, 0.4, 0.126])
-
-        # helpers: create DH rows and clamp limits
-        def dh_row(d, alpha, a, theta):
-            return [d, alpha, a, theta]
-
-        def deg2rad_list(list_of_pairs):
-            return np.deg2rad(np.array(list_of_pairs, dtype=float))
-
-        self.T_b_ob = np.array(
+        self.T_b_ob = np.eye(4)
+        self.T_e_oe = np.eye(4)
+        self.dh_params = np.array(
             [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ]
+                [self.link_lengths[0], -np.pi / 2, 0.0, 0.0],
+                [0.0, np.pi / 2, 0.0, 0.0],
+                [self.link_lengths[1], np.pi / 2, 0.0, 0.0],
+                [0.0, -np.pi / 2, 0.0, 0.0],
+                [self.link_lengths[2], -np.pi / 2, 0.0, 0.0],
+                [0.0, np.pi / 2, 0.0, 0.0],
+                [self.link_lengths[3], 0.0, 0.0, 0.0],
+            ],
+            dtype=float,
         )
-
-        self.T_e_oe = np.array(
-            [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ]
-        )
-
-        # fmt: off
-        dh = [
-            dh_row(self.link_lengths[0],  -np.pi / 2,  0.0,  0.0),
-            dh_row(0.0,                    np.pi / 2,  0.0,  0.0),
-            dh_row(self.link_lengths[1],   np.pi / 2,  0.0,  0.0),
-            dh_row(0.0,                   -np.pi / 2,  0.0,  0.0),
-            dh_row(self.link_lengths[2],  -np.pi / 2,  0.0,  0.0),
-            dh_row(0.0,                    np.pi / 2,  0.0,  0.0),
-            dh_row(self.link_lengths[3],   0.0,        0.0,  0.0),
-        ]
-        # fmt: on
-
-        limits = [
-            [-180.0, 180.0],
-            [-180.0, 180.0],
-            [-180.0, 180.0],
-            [-180.0, 180.0],
-            [-180.0, 180.0],
-            [-180.0, 180.0],
-            [-180.0, 180.0],
-        ]
-        rotation_directions = np.array([1, 1, 1, 1, 1, 1, 1])
-
-        # finalize arrays
-        self.dh_params = np.array(dh, dtype=float)
-        self.qpos_limits = deg2rad_list(limits)
-        self.rotation_directions = rotation_directions
-
-        # sanity checks
-        assert self.dh_params.shape == (7, 4), "dh_params must be shape (7,4)"
-        assert self.qpos_limits.shape == (7, 2), "qpos_limits must be shape (7,2)"
+        self.qpos_limits = np.tile(np.deg2rad([-180.0, 180.0]), (7, 1))
+        self.rotation_directions = np.ones(7, dtype=int)
 
 
 @dataclass
@@ -279,14 +254,11 @@ class _BaseSRSSolverImpl:
     """Base implementation for the SRS inverse kinematics solver."""
 
     def __init__(self, cfg: SRSSolverCfg, device: torch.device):
-        # Initialize configuration and device
         self.cfg = cfg
         self.cfg.validate()
         self.device = device
         self.dofs = 7
         self.dh_params = np.asarray(cfg.dh_params)
-        self.tcp_xpos = np.eye(4)
-        # Initialize transformation matrices
         self._parse_params()
 
     def _parse_params(self):
@@ -300,6 +272,16 @@ class _BaseSRSSolverImpl:
         self.dh_params_np = np.asarray(self.cfg.dh_params)
         self.link_lengths_np = np.asarray(self.cfg.link_lengths)
         self.rotation_directions_np = np.asarray(self.cfg.rotation_directions)
+
+        self.ik_nearst_weight = np.asarray(self.cfg.ik_nearest_weight, dtype=float)
+
+    @property
+    def _distance_weights(self):
+        # A common positive scale does not affect nearest-solution ordering.
+        # Normalize before squaring or converting to float32 to avoid overflow
+        # and underflow for otherwise valid finite user weights.
+        scale = np.max(self.ik_nearst_weight)
+        return self.ik_nearst_weight / scale if scale > 0 else self.ik_nearst_weight
 
 
 class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
@@ -324,13 +306,60 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
         self.elbow_angles = np.linspace(
             -np.pi, np.pi, self.cfg.num_samples, endpoint=False
         )
-        self.ik_nearst_weight = np.asarray(self.cfg.ik_nearest_weight, dtype=float)
+
+    def _validate_inputs(self, target_xpos, qpos_seed):
+        """Keep rigid-pose checks in float32 inside an application autocast scope."""
+        with torch.autocast(device_type=self.device.type, enabled=False):
+            if not bool(torch.isfinite(target_xpos).all()):
+                raise ValueError("target_xpos must contain only finite values")
+            rotation = target_xpos[:, :3, :3]
+            identity = torch.eye(3, dtype=target_xpos.dtype, device=self.device)
+            bottom = torch.tensor(
+                [0, 0, 0, 1], dtype=target_xpos.dtype, device=self.device
+            )
+            if (
+                not torch.allclose(
+                    target_xpos[:, 3],
+                    bottom,
+                    atol=1e-6,
+                    rtol=0,
+                )
+                or not torch.allclose(
+                    rotation.transpose(1, 2) @ rotation,
+                    identity,
+                    atol=1e-6,
+                    rtol=0,
+                )
+                or not torch.allclose(
+                    torch.linalg.det(rotation),
+                    target_xpos.new_tensor(1.0),
+                    atol=1e-6,
+                    rtol=0,
+                )
+            ):
+                raise ValueError(
+                    "target_xpos must contain rigid homogeneous transforms"
+                )
+            if qpos_seed is not None:
+                if not bool(torch.isfinite(qpos_seed).all()):
+                    raise ValueError("qpos_seed must contain only finite values")
 
     def _dh_transform(self, d, alpha, a, theta) -> np.ndarray:
         """Build standard DH transforms, broadcasting over joint arrays."""
-        d, alpha, a, theta = np.broadcast_arrays(d, alpha, a, theta)
-        ct, st, ca, sa = np.cos(theta), np.sin(theta), np.cos(alpha), np.sin(alpha)
-        transforms = np.zeros(theta.shape + (4, 4))
+        shape = np.broadcast(d, alpha, a, theta).shape
+        return self._fill_dh(
+            np.zeros(shape + (4, 4)),
+            d,
+            a,
+            np.cos(theta),
+            np.sin(theta),
+            np.cos(alpha),
+            np.sin(alpha),
+        )
+
+    @staticmethod
+    def _fill_dh(transforms, d, a, ct, st, ca, sa):
+        """Fill DH entries in zeroed output storage."""
         transforms[..., 0, 0] = ct
         transforms[..., 0, 1] = -st * ca
         transforms[..., 0, 2] = st * sa
@@ -345,6 +374,31 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
         transforms[..., 3, 3] = 1.0
         return transforms
 
+    def _iter_joint_transforms(self, qpos, stop=7):
+        """Yield joint transforms; large batches reuse one matrix buffer."""
+        if qpos.ndim != 2 or len(qpos) < 256:
+            transforms = self._joint_transforms(qpos, stop)
+            if qpos.ndim > 1:
+                transforms = np.moveaxis(transforms, -3, 0)
+            yield from transforms
+            return
+        d, alpha, a, theta = self.dh_params[:stop].T
+        ct = qpos[:, :stop] + theta
+        st = np.sin(ct)
+        np.cos(ct, out=ct)
+        ca, sa = np.cos(alpha), np.sin(alpha)
+        transform = np.zeros((len(qpos), 4, 4))
+        for index in range(stop):
+            yield self._fill_dh(
+                transform,
+                d[index],
+                a[index],
+                ct[:, index],
+                st[:, index],
+                ca[index],
+                sa[index],
+            )
+
     def _joint_transforms(self, qpos, stop=7):
         d, alpha, a, theta = self.dh_params[:stop].T
         return self._dh_transform(d, alpha, a, theta + qpos[..., :stop])
@@ -358,14 +412,7 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
         return poses
 
     def _configuration(self, rconf: int) -> tuple:
-        r"""Determine the configuration of the arm, elbow, and wrist based on a configuration integer.
-
-        Args:
-            rconf (int): The configuration integer.
-
-        Returns:
-            tuple: A tuple containing the configurations of the arm, elbow, and wrist.
-        """
+        """Decode shoulder, elbow and wrist signs from the three branch bits."""
         arm_config = -1 if rconf & 1 else 1
         elbow_config = -1 if rconf & 2 else 1
         wrist_config = -1 if rconf & 4 else 1
@@ -373,14 +420,7 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
 
     @staticmethod
     def skew(vector: np.ndarray) -> np.ndarray:
-        r"""Compute the skew-symmetric matrix of a vector.
-
-        Args:
-            vector (np.ndarray): A 3D vector.
-
-        Returns:
-            np.ndarray: The skew-symmetric matrix of the input vector.
-        """
+        """Return the cross-product matrix of a three-vector."""
         return np.array(
             [
                 [0, -vector[2], vector[1]],
@@ -392,15 +432,7 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
     def _calculate_joint_angles(
         self, P_s_to_w: np.ndarray, elbow_GC4: int
     ) -> typing.Tuple[bool, typing.Optional[np.ndarray]]:
-        r"""Calculate joint angles based on the position from shoulder to wrist and elbow configuration.
-
-        Args:
-            P_s_to_w (np.ndarray): The position vector from shoulder to wrist.
-            elbow_GC4 (int): The elbow configuration parameter.
-
-        Returns:
-            np.ndarray: A boolean indicating success and an array of joint angles.
-        """
+        """Build reference shoulder/elbow angles for a reachable wrist centre."""
         d_se, d_ew = self.link_lengths[1:3]
         joints = np.zeros(7)
 
@@ -408,13 +440,15 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
         norm_P26 = np.linalg.norm(P_s_to_w)
         if norm_P26 < 1e-12:
             return False, None
-        if not (
-            d_se + d_ew + 1e-10 >= norm_P26 and norm_P26 + 1e-10 >= abs(d_se - d_ew)
-        ):
+        # Float32 pose rounding can put full extension just outside the triangle.
+        # Returned solutions still have to pass the FK residual checks.
+        if not (d_se + d_ew + 1e-6 >= norm_P26 and norm_P26 + 1e-6 >= abs(d_se - d_ew)):
             logger.debug("Specified pose outside reachable workspace.")
             return False, None
 
         elbow_cos_angle = (norm_P26**2 - d_se**2 - d_ew**2) / (2 * d_se * d_ew)
+        if abs(elbow_cos_angle) > 1.0 + 1e-6:
+            return False, None
 
         joints[3] = elbow_GC4 * np.arccos(np.clip(elbow_cos_angle, -1.0, 1.0))
 
@@ -491,9 +525,14 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
         return shoulder, wrist, joints[3]
 
     def _candidate_joint_angles(self, prepared, nsparams, rconf, joint_seed):
-        """Decompose one branch for a scalar or a vector of arm angles."""
+        """Decompose scalar requests or mixed branches sharing elbow geometry."""
         shoulder, wrist, elbow_angle = prepared
-        arm_config, _, wrist_config = self._configuration(rconf)
+        if isinstance(rconf, (int, np.integer)):
+            arm_config, _, wrist_config = self._configuration(rconf)
+        else:
+            rconf = np.asarray(rconf)
+            arm_config = np.where(rconf & 1, -1, 1)
+            wrist_config = np.where(rconf & 4, -1, 1)
         psi = np.asarray(nsparams)
         sine, cosine = np.sin(psi)[..., None, None], np.cos(psi)[..., None, None]
         r03 = shoulder[0] * sine + shoulder[1] * cosine + shoulder[2]
@@ -640,10 +679,9 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
 
     def _get_fk(self, qpos):
         joints = np.asarray(qpos, dtype=float) * self.rotation_directions_np
-        transforms = self._joint_transforms(joints)
-        pose = np.broadcast_to(self.cfg.T_b_ob, joints.shape[:-1] + (4, 4)).copy()
-        for index in range(7):
-            pose = pose @ transforms[..., index, :, :]
+        pose = np.broadcast_to(self.cfg.T_b_ob, joints.shape[:-1] + (4, 4))
+        for transform in self._iter_joint_transforms(joints):
+            pose = pose @ transform
         return pose @ self.flange_to_ee
 
     def _local_target(self, target):
@@ -676,6 +714,31 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
         position = np.linalg.norm(actual[..., :3, 3] - target[:3, 3], axis=-1)
         rotation = np.linalg.norm(actual[..., :3, :3] - target[:3, :3], axis=(-2, -1))
         return (position <= 1e-4) & (rotation <= np.sqrt(8.0) * np.sin(5e-5))
+
+    def _configuration_candidates(self, local, angles, branches, seed):
+        """Decompose mixed branch/angle requests in their original input order."""
+        output = np.zeros((len(angles), 7))
+        success = np.zeros(len(angles), dtype=bool)
+        for elbow in (1, -1):
+            rows = np.flatnonzero((branches & 2) == (0 if elbow > 0 else 2))
+            if not len(rows):
+                continue
+            geometry = self._prepare_ik(local, elbow)
+            if geometry is None:
+                continue
+            candidates = (
+                self._candidate_joint_angles(
+                    geometry,
+                    angles[rows],
+                    branches[rows],
+                    seed * self.rotation_directions_np,
+                )
+                * self.rotation_directions_np
+            )
+            candidates, valid = self._map_to_limits(candidates, seed)
+            output[rows[valid]] = candidates[valid]
+            success[rows] = valid
+        return success, output
 
     def get_ik(
         self,
@@ -763,23 +826,14 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
                         continue
                 except (ValueError, FloatingPointError):
                     pass
-            blocks = []
-            for branch in range(8):
-                joints = (
-                    self._candidate_joint_angles(
-                        prepare(branch),
-                        self.elbow_angles,
-                        branch,
-                        seed * self.rotation_directions_np,
-                    )
-                    * self.rotation_directions_np
-                )
-                joints, valid = self._map_to_limits(joints, seed)
-                blocks.append(joints[valid])
-            candidates = np.concatenate(blocks)
+            branches = np.repeat(np.arange(8), len(self.elbow_angles))
+            valid, joints = self._configuration_candidates(
+                local_target, np.tile(self.elbow_angles, 8), branches, seed
+            )
+            candidates = joints[valid]
             if self.cfg.sort_ik:
                 distances = np.linalg.norm(
-                    (candidates - seed) * self.ik_nearst_weight, axis=-1
+                    (candidates - seed) * self._distance_weights, axis=-1
                 )
                 candidates = candidates[np.argsort(distances, kind="stable")]
             if return_all_solutions:
@@ -791,16 +845,13 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
                     if self._valid_poses(joints, target):
                         output[row, 0], success[row] = joints, True
                         break
-        return torch.as_tensor(success, device=self.device), torch.as_tensor(
+        return _as_tensor(success, device=self.device), _as_tensor(
             output, device=self.device
         )
 
 
 class _WarpSRSSolverImpl(_BaseSRSSolverImpl):
     """Warp implementation for CUDA or CPU devices."""
-
-    def __init__(self, cfg: SRSSolverCfg, device: torch.device):
-        super().__init__(cfg, device)
 
     def _parse_params(self):
         super()._parse_params()
@@ -827,9 +878,7 @@ class _WarpSRSSolverImpl(_BaseSRSSolverImpl):
             device=standardize_device_string(self.device),
         )
 
-        # Generate all possible configuration combinations for shoulder, elbow, and wrist.
-        # Each configuration is represented by a vector of three elements, each being +1 or -1.
-        # This covers all 8 possible sign combinations for the three joints.
+        # Branch order is part of deterministic solution tie breaking.
         self.configs = [
             wp.vec3(
                 1 if i & 1 == 0 else -1,
@@ -842,30 +891,56 @@ class _WarpSRSSolverImpl(_BaseSRSSolverImpl):
             self.configs, dtype=wp.vec3, device=standardize_device_string(self.device)
         )
 
-        # Generate a set of elbow angles sampled uniformly from -π to π.
-        # The number of samples is determined by self.cfg.num_samples.
-        # These angles are used for searching possible IK solutions.
-        joint_reference_limits = [-wp.pi, wp.pi]
         self.elbow_angles = np.linspace(
-            joint_reference_limits[0],
-            joint_reference_limits[1],
-            self.cfg.num_samples,
-            endpoint=False,
+            -wp.pi, wp.pi, self.cfg.num_samples, endpoint=False
         ).tolist()
-
-        # Convert elbow angles to Warp array for CUDA computation.
         self.elbow_angles_wp = wp.array(
             self.elbow_angles,
             dtype=float,
             device=standardize_device_string(self.device),
         )
+        self._weight_values = None
+        self._refresh_weights()
+        self._workspace_key = None
+        self._workspace = {}
+        self._workspace_views = {}
+        self._validation_error = wp.zeros(
+            1, dtype=int, device=standardize_device_string(self.device)
+        )
+        self._validation_status = _torch_view(self._validation_error)
+
+    def _refresh_weights(self):
+        """Refresh device constants after a live configuration weight edit."""
+        weights = np.asarray(self.cfg.ik_nearest_weight, dtype=float)
+        if np.array_equal(weights, self._weight_values):
+            return
+        if (
+            weights.shape != (7,)
+            or not np.all(np.isfinite(weights))
+            or np.any(weights < 0)
+        ):
+            raise ValueError(
+                "ik_nearest_weight must be seven finite non-negative values"
+            )
+        self._weight_values = weights.copy()
+        self.ik_nearst_weight = weights
+        # Singular shoulder/wrist pairs need only their local weight ratio.
+        # Normalize each pair independently so other joints cannot erase it.
+        singular_weights = np.zeros(7)
+        for pair in ([0, 2], [4, 6]):
+            weights = self.ik_nearst_weight[pair]
+            scale = np.max(weights)
+            singular_weights[pair] = weights / scale if scale > 0 else weights
         self.nearest_weights_wp = wp.array(
-            np.asarray(self.cfg.ik_nearest_weight, dtype=np.float32),
+            singular_weights,
             dtype=float,
             device=standardize_device_string(self.device),
         )
-        self._workspace_key = None
-        self._workspace = {}
+        self.distance_weights_wp = wp.array(
+            self._distance_weights,
+            dtype=float,
+            device=standardize_device_string(self.device),
+        )
 
     def _ensure_workspace(self, num_targets: int, num_combinations: int) -> dict:
         """Reuse large device buffers across control-loop calls of equal shape."""
@@ -873,373 +948,143 @@ class _WarpSRSSolverImpl(_BaseSRSSolverImpl):
         if key == self._workspace_key:
             return self._workspace
         device = standardize_device_string(self.device)
-        self._workspace_key = key
         self._workspace = {
             "xpos": wp.empty(num_targets, dtype=wp.mat44, device=device),
+            "geometry": wp.empty(num_targets * 2, dtype=IKGeometry, device=device),
             "qpos": wp.empty(num_combinations * 7, dtype=float, device=device),
             "success": wp.empty(num_combinations, dtype=int, device=device),
         }
+        self._workspace_views = {
+            name: _torch_view(self._workspace[name]) for name in ("qpos", "success")
+        }
+        self._workspace_key = key
         return self._workspace
 
-    def _sort_ik_solutions(
-        self, qpos_out_wp, success_wp, qpos_seed, num_targets, num_configs, num_angles
-    ):
-        """
-        Sort IK solutions based on weighted distance.
-
-        Args:
-            qpos_out_wp: Warp array of IK solutions (shape: [num_targets * num_configs * num_angles, 7]).
-            success_wp: Warp array of validity flags (shape: [num_targets * num_configs * num_angles]).
-            qpos_seed: Warp array of seed positions (shape: [num_targets, 7]).
-            num_targets: Number of targets.
-            num_configs: Number of configurations.
-            num_angles: Number of angles.
-
-        Returns:
-            Tuple[wp.array, wp.array]: Sorted IK solutions and their validity flags.
-        """
-        N = num_targets
-        N_SOL = num_configs * num_angles
-        DOF = 7
-
-        sorted_ik_solutions = wp.zeros(
-            N * N_SOL * DOF, dtype=float, device=standardize_device_string(self.device)
-        )
-        sorted_ik_valid_flags = wp.zeros(
-            N * N_SOL, dtype=int, device=standardize_device_string(self.device)
-        )
-        distances = wp.zeros(
-            N * N_SOL, dtype=float, device=standardize_device_string(self.device)
-        )
-        indices = wp.zeros(
-            N * N_SOL, dtype=int, device=standardize_device_string(self.device)
-        )
-
+    def _solution_distances(self, seed, num_per_target):
+        """Reuse one scalar score per candidate; Torch performs the stable reduction."""
+        success_wp = self._workspace["success"]
+        distances = self._workspace.get("distances")
+        if distances is None:
+            distances = wp.empty(
+                success_wp.shape[0],
+                dtype=float,
+                device=standardize_device_string(self.device),
+            )
+            self._workspace["distances"] = distances
+            self._workspace_views["distances"] = _torch_view(distances)
         wp.launch(
-            kernel=sort_ik_kernel,
-            dim=num_targets,
+            ik_distance_kernel,
+            dim=success_wp.shape[0],
             inputs=[
-                qpos_out_wp,
+                self._workspace["qpos"],
                 success_wp,
-                qpos_seed,
-                wp.array(
-                    self.cfg.ik_nearest_weight,
-                    dtype=float,
-                    device=standardize_device_string(self.device),
-                ),
-                distances,
-                indices,
-                N_SOL,
+                wp.from_torch(seed.contiguous().flatten()),
+                self.distance_weights_wp,
+                num_per_target,
             ],
-            outputs=[
-                sorted_ik_solutions,
-                sorted_ik_valid_flags,
-            ],
+            outputs=[distances],
             device=standardize_device_string(self.device),
         )
-        return sorted_ik_solutions, sorted_ik_valid_flags
+        return self._workspace_views["distances"].view(-1, num_per_target)
 
-    def _nearest_ik_solution(
-        self, qpos_out_wp, success_wp, qpos_seed, num_targets, num_configs, num_angles
-    ):
-        """
-        Find the nearest valid IK solution for each target pose.
-
-        Selects the IK solution closest to the seed configuration among all valid solutions.
-
-        Args:
-            qpos_out_wp: IK solutions array of shape [num_targets * num_configs * num_angles, 7]
-            success_wp: Validity flags array of shape [num_targets * num_configs * num_angles]
-            qpos_seed: Seed configurations array of shape [num_targets, 7]
-            num_targets: Number of target poses
-            num_configs: Number of IK configurations
-            num_angles: Number of sampling angles
-
-        Returns:
-            Tuple[wp.array, wp.array]:
-                - Nearest IK solutions array of shape [num_targets, 7]
-                - Validity flags array of shape [num_targets] indicating solution feasibility
-        """
-        N = num_targets
-        N_SOL = num_configs * num_angles
-        DOF = 7
-
-        nearest_ik_solutions = wp.zeros(
-            N * DOF, dtype=float, device=standardize_device_string(self.device)
-        )
-        nearest_ik_valid_flags = wp.zeros(
-            N, dtype=int, device=standardize_device_string(self.device)
-        )
-
-        wp.launch(
-            kernel=nearest_ik_kernel,
-            dim=num_targets,
-            inputs=[
-                qpos_out_wp,
-                success_wp,
-                qpos_seed.flatten(),
-                wp.array(
-                    self.cfg.ik_nearest_weight,
-                    dtype=float,
-                    device=standardize_device_string(self.device),
-                ),
-                N_SOL,
-            ],
-            outputs=[
-                nearest_ik_solutions,
-                nearest_ik_valid_flags,
-            ],
-            device=standardize_device_string(self.device),
-        )
-        return nearest_ik_solutions, nearest_ik_valid_flags
-
-    def _process_all_solutions(
-        self,
-        qpos_out_wp: wp.array,
-        success_wp: wp.array,
-        qpos_seed: wp.array,
-        num_targets: int,
-        num_configs: int,
-        num_angles: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Process and return all valid IK solutions.
-
-        Args:
-            qpos_out_wp: Warp array of IK solutions.
-            success_wp: Warp array of success flags.
-            qpos_seed: Seed joint positions.
-            num_targets: Number of target poses.
-            num_configs: Number of configurations.
-            num_angles: Number of angles.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Success flags and all valid joint positions.
-        """
-        num_per_target = num_configs * num_angles
-        solutions = wp.to_torch(qpos_out_wp).view(num_targets, num_per_target, 7)
-        valid = wp.to_torch(success_wp).view(num_targets, num_per_target).bool()
+    def _select_solutions(self, seed, count, candidates, return_all):
+        """Rank valid candidates and return independent, zero-masked outputs."""
+        joints = self._workspace_views["qpos"].view(count, candidates, 7)
+        valid = self._workspace_views["success"].view(count, candidates).bool()
+        success = valid.any(dim=1)
         if self.cfg.sort_ik:
-            weights = torch.as_tensor(
-                self.cfg.ik_nearest_weight, dtype=solutions.dtype, device=self.device
-            )
-            distances = torch.linalg.vector_norm(
-                (solutions - qpos_seed[:, None, :]) * weights, dim=2
-            ).masked_fill(~valid, torch.inf)
-            order = distances.argsort(dim=1, stable=True)
-            solutions = torch.gather(solutions, 1, order[:, :, None].expand(-1, -1, 7))
-            valid = torch.gather(valid, 1, order)
-        return valid.any(dim=1), solutions.masked_fill(~valid[:, :, None], 0.0)
-
-    def _process_single_solution(
-        self,
-        qpos_out_wp: wp.array,
-        success_wp: wp.array,
-        qpos_seed: wp.array,
-        num_targets: int,
-        num_configs: int,
-        num_angles: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Process and return the nearest valid IK solution for each target.
-
-        Args:
-            qpos_out_wp: Warp array of IK solutions.
-            success_wp: Warp array of success flags.
-            qpos_seed: Seed joint positions.
-            num_targets: Number of target poses.
-            num_configs: Number of configurations.
-            num_angles: Number of angles.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Success flags and nearest valid joint positions.
-        """
-        num_per_target = num_configs * num_angles
-        solutions = wp.to_torch(qpos_out_wp).view(num_targets, num_per_target, 7)
-        valid = wp.to_torch(success_wp).view(num_targets, num_per_target).bool()
-        if self.cfg.sort_ik:
-            weights = torch.as_tensor(
-                self.cfg.ik_nearest_weight, dtype=solutions.dtype, device=self.device
-            )
-            distances = torch.linalg.vector_norm(
-                (solutions - qpos_seed[:, None, :]) * weights, dim=2
-            ).masked_fill(~valid, torch.inf)
-            index = distances.argmin(dim=1)
-        else:
+            distances = self._solution_distances(seed, candidates)
+            if return_all:
+                order = distances.argsort(dim=1, stable=True)
+                joints = torch.gather(joints, 1, order[:, :, None].expand(-1, -1, 7))
+                valid = torch.gather(valid, 1, order)
+            else:
+                index = distances.argmin(dim=1)
+        elif not return_all:
             index = valid.to(torch.int32).argmax(dim=1)
-        rows = torch.arange(num_targets, device=self.device)
-        has_solution = valid.any(dim=1)
-        nearest = solutions[rows, index].masked_fill(~has_solution[:, None], 0.0)
-        return has_solution, nearest[:, None, :]
+        if return_all:
+            return success, joints.masked_fill(~valid[:, :, None], 0.0)
+        rows = torch.arange(count, device=self.device)
+        nearest = joints[rows, index].masked_fill(~success[:, None], 0.0)
+        return success, nearest[:, None, :]
 
-    def _check_success_flags(
-        self,
-        success_wp: wp.array,
-        num_targets: int,
-        num_configs: int,
-        num_angles: int,
-    ) -> torch.Tensor:
-        """
-        Check success flags for IK solutions.
-
-        Args:
-            success_wp: Warp array of success flags.
-            num_targets: Number of target poses.
-            num_configs: Number of configurations.
-            num_angles: Number of angles.
-
-        Returns:
-            torch.Tensor: Success flags as a boolean tensor.
-        """
-        num_solutions = num_configs * num_angles
-        success_flags_wp = wp.empty(
-            num_targets, dtype=int, device=standardize_device_string(self.device)
-        )
+    def _validate_inputs(self, targets, seed):
+        """Report the same input errors with one device-to-host status read."""
+        self._validation_error.zero_()
         wp.launch(
-            kernel=check_success_kernel,
-            dim=num_targets,
+            validate_ik_inputs_kernel,
+            dim=targets.shape[0],
             inputs=[
-                success_wp,
-                num_solutions,
+                wp.from_torch(targets.contiguous(), dtype=wp.mat44),
+                (
+                    wp.from_torch(seed.contiguous().flatten())
+                    if seed is not None
+                    else None
+                ),
+                int(seed is not None),
             ],
-            outputs=[
-                success_flags_wp,
-            ],
+            outputs=[self._validation_error],
             device=standardize_device_string(self.device),
         )
-        return wp.to_torch(success_flags_wp).bool().to(self.device)
+        code = int(self._validation_status.item())
+        if code == 3:
+            raise ValueError("target_xpos must contain only finite values")
+        if code == 2:
+            raise ValueError("target_xpos must contain rigid homogeneous transforms")
+        if code == 1:
+            raise ValueError("qpos_seed must contain only finite values")
 
-    def _compute_ik_solutions(
-        self,
-        xpos_wp: wp.array,
-        qpos_out_wp: wp.array,
-        success_wp: wp.array,
-        num_combinations: int,
-        qpos_seed: torch.Tensor,
-    ) -> None:
-        """
-        Compute IK solutions using the provided combinations.
-
-        Args:
-            xpos_wp: Transformed target poses.
-            qpos_out_wp: Output array for joint positions.
-            success_wp: Output array for success flags.
-            num_combinations: Total number of combinations to process.
-        """
-        # Launch kernel to compute IK solutions
+    def get_ik(self, target_xpos, qpos_seed, return_all_solutions=False, **kwargs):
+        """Evaluate the global grid; inputs are validated by SRSSolver.get_ik."""
+        self._refresh_weights()
+        targets = wp.from_torch(target_xpos, dtype=wp.mat44)
+        count = target_xpos.shape[0]
+        candidates = len(self.configs) * len(self.elbow_angles)
+        workspace = self._ensure_workspace(count, count * candidates)
+        device = standardize_device_string(self.device)
         wp.launch(
-            kernel=compute_ik_kernel,
-            dim=num_combinations,
-            inputs=(
-                xpos_wp,
+            prepare_ik_geometry_kernel,
+            dim=count * 2,
+            inputs=[
+                targets,
+                self.T_b_ob_inv_wp,
+                self.T_e_oe_inv_wp,
+                self.tcp_inv_wp,
+                self.dh_params_wp,
+                self.link_lengths_wp,
+            ],
+            outputs=[workspace["xpos"], workspace["geometry"]],
+            device=device,
+        )
+        if qpos_seed is None:
+            qpos_seed = torch.zeros((count, 7), dtype=torch.float32, device=self.device)
+        wp.launch(
+            compute_prepared_ik_kernel,
+            dim=count * candidates,
+            inputs=[
+                workspace["xpos"],
+                workspace["geometry"],
                 self.elbow_angles_wp,
                 self.qpos_limits_wp,
                 self.configs_wp,
                 self.dh_params_wp,
-                self.link_lengths_wp,
                 self.rotation_directions_wp,
-                wp.from_torch(qpos_seed.contiguous().flatten()),
+                wp.from_torch(qpos_seed.flatten()),
                 self.nearest_weights_wp,
-            ),
-            outputs=[success_wp, qpos_out_wp],
-            device=standardize_device_string(self.device),
-        )
-
-    def get_ik(
-        self,
-        target_xpos: torch.Tensor,
-        qpos_seed: torch.Tensor,
-        return_all_solutions: bool = False,
-        **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Compute inverse kinematics (IK) for the given target pose.
-
-        Args:
-            target_xpos: Target end-effector pose (4x4).
-            qpos_seed: Initial joint positions (rad).
-            return_all_solutions: Whether to return all solutions.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: Success flag and joint positions.
-        """
-        # Prepare inputs
-        target_xpos = target_xpos.to(self.device)
-        target_xpos = target_xpos.view(-1, 4, 4)
-        target_xpos_wp = wp.from_torch(target_xpos, dtype=wp.mat44)
-
-        num_targets = target_xpos_wp.shape[0]
-        num_configs = len(self.configs)
-        num_angles = len(self.elbow_angles)
-        num_combinations = num_targets * num_configs * num_angles
-        workspace = self._ensure_workspace(num_targets, num_combinations)
-
-        # transform pose
-        xpos_wp = workspace["xpos"]
-        wp.launch(
-            kernel=transform_pose_kernel,
-            dim=target_xpos_wp.shape[0],
-            inputs=[
-                target_xpos_wp,
-                self.T_b_ob_inv_wp,
-                self.T_e_oe_inv_wp,
-                self.tcp_inv_wp,
             ],
-            outputs=[xpos_wp],
-            device=standardize_device_string(self.device),
+            outputs=[workspace["success"], workspace["qpos"]],
+            device=device,
         )
-
-        # Define configurations and angles
-        if qpos_seed is None:
-            qpos_seed = torch.zeros(
-                (target_xpos.shape[0], 7),
-                dtype=torch.float32,
-                device=self.device,
-            )
-        else:
-            qpos_seed = qpos_seed.to(self.device, dtype=torch.float32).view(-1, 7)
-            # TODO: Currently, full-space sampling is used to temporarily address situations
-            # where joint space discontinuities or solution failures occur in different user scenarios.
-            # Future plans include reducing the sampling space and adjusting the configuration.
-            #
-            # self.configs = [wp.vec3(*np.sign(qpos_seed[[1, 3, 5]].cpu().numpy()))]
-
-        # Prepare output arrays
-        qpos_out_wp = workspace["qpos"]
-        success_wp = workspace["success"]
-
-        # Compute IK solutions
-        self._compute_ik_solutions(
-            xpos_wp, qpos_out_wp, success_wp, num_combinations, qpos_seed
-        )
-
-        # Device-side masking below handles the all-failed case without a host
-        # synchronization or an extra success-count kernel.
-        if return_all_solutions:
-            return self._process_all_solutions(
-                qpos_out_wp,
-                success_wp,
-                qpos_seed,
-                num_targets,
-                num_configs,
-                num_angles,
-            )
-        return self._process_single_solution(
-            qpos_out_wp,
-            success_wp,
+        return self._select_solutions(
             qpos_seed,
-            num_targets,
-            num_configs,
-            num_angles,
+            count,
+            candidates,
+            return_all_solutions,
         )
 
 
 class SRSSolver:
-    r"""SRS inverse kinematics (IK) controller.
-
-    This controller implements SRS inverse kinematics using various methods for
-    computing the inverse of the Jacobian matrix.
-    """
+    """Analytical SRS FK/IK with NumPy or Warp batch execution."""
 
     def __init__(
         self,
@@ -1249,20 +1094,7 @@ class SRSSolver:
         use_warp: bool | None = None,
         **kwargs,
     ):
-        r"""Initializes the SRS kinematics solver.
-
-            This constructor sets up the kinematics solver using SRS methods,
-            allowing for efficient computation of robot kinematics based on
-            the specified URDF model.
-
-        Args:
-            cfg: The configuration for the solver.
-            num_envs (int): The number of environments for the solver.
-            device (str, optional): The device to use for the solver (e.g., "cpu" or "cuda").
-            **kwargs: Additional keyword arguments passed to the base solver.
-
-        """
-        # super().__init__(cfg=cfg, num_envs=num_envs, device=device, **kwargs)  # 移除父类初始化
+        """Validate configuration and initialize the selected batch backend."""
 
         self.cfg = cfg
         self.cfg.validate()
@@ -1271,16 +1103,14 @@ class SRSSolver:
         self.num_envs = num_envs
 
         if device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        elif isinstance(device, str):
-            self.device = torch.device(device)
-        else:
-            self.device = device
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = _resolve_device(device)
         self.use_warp = self.device.type == "cuda" if use_warp is None else use_warp
         if self.device.type == "cuda" and not self.use_warp:
             raise ValueError("CUDA execution requires the Warp backend")
         if self.use_warp:
             _ensure_writable_warp_cache()
+            wp.init()
 
         self.urdf_path = getattr(cfg, "urdf_path", None)
         self.joint_names = getattr(cfg, "joint_names", None)
@@ -1292,34 +1122,11 @@ class SRSSolver:
 
         self.dof = len(self.joint_names) if self.joint_names else self.dofs
 
-        # Weight for nearest neighbor search in IK (Inverse Kinematics) algorithms
-        if hasattr(cfg, "ik_nearest_weight") and cfg.ik_nearest_weight is not None:
-            if len(cfg.ik_nearest_weight) != self.dof:
-                logging.getLogger(__name__).error(
-                    f"Length of ik_nearest_weight ({len(cfg.ik_nearest_weight)}) does not match the number of DOF ({self.dof})."
-                )
-            self.ik_nearest_weight = torch.tensor(
-                cfg.ik_nearest_weight, dtype=torch.float32, device=self.device
-            )
-        else:
-            self.ik_nearest_weight = torch.ones(
-                self.dof, dtype=torch.float32, device=self.device
-            )
-
+        self.ik_nearest_weight = torch.tensor(
+            cfg.ik_nearest_weight, dtype=torch.float32, device=self.device
+        )
         self.tcp_xpos = np.eye(4)
-
-        # Tool Center Point (TCP) position
-        self.tcp_xpos = np.eye(4)
-
-        # 兼容无 pk_serial_chain 情况
-        if hasattr(self, "pk_serial_chain"):
-            fk_dict = self.pk_serial_chain.forward_kinematics(
-                th=np.zeros(7), end_only=False
-            )
-            root_tf = fk_dict[next(iter(fk_dict))]
-            self.root_base_xpos = root_tf.get_matrix().cpu().numpy()
-        else:
-            self.root_base_xpos = np.eye(4)
+        self.root_base_xpos = np.eye(4)
 
         # Initialize joint position limits from cfg
         qpos_limits = np.asarray(cfg.qpos_limits)  # shape (7, 2)
@@ -1330,13 +1137,14 @@ class SRSSolver:
             qpos_limits[:, 1], dtype=torch.float32, device=self.device
         )
 
-        # Initialize implementation based on device
-        if self.use_warp:
-            self.impl = _WarpSRSSolverImpl(cfg, self.device)
-        else:
-            self.impl = _CPUSRSSolverImpl(cfg, self.device)
+        with _torch_stream(self.device):
+            # Initialize implementation based on device
+            if self.use_warp:
+                self.impl = _WarpSRSSolverImpl(cfg, self.device)
+            else:
+                self.impl = _CPUSRSSolverImpl(cfg, self.device)
 
-        self._update_impl_qpos_limits()
+            self._update_impl_qpos_limits()
 
         # Explicit branch/arm-angle queries are inexpensive scalar geometry.
         # Reuse the CPU implementation even when the batch solver is on CUDA.
@@ -1373,27 +1181,28 @@ class SRSSolver:
 
     def set_tcp(self, transform: np.ndarray | torch.Tensor) -> None:
         """Set the flange-to-tool transform and refresh cached device constants."""
-        tcp = np.asarray(torch.as_tensor(transform).detach().cpu(), dtype=np.float64)
+        tcp = np.asarray(_as_tensor(transform).detach().cpu(), dtype=np.float64)
         _validate_pose(tcp)
         self.cfg.tcp = tcp.copy()
-        if self.use_warp:
-            self.impl = _WarpSRSSolverImpl(self.cfg, self.device)
-            self._geometry_impl = _CPUSRSSolverImpl(self.cfg, torch.device("cpu"))
-        else:
-            self.impl = _CPUSRSSolverImpl(self.cfg, self.device)
-            self._geometry_impl = self.impl
-        self._update_impl_qpos_limits()
+        with _torch_stream(self.device):
+            if self.use_warp:
+                self.impl = _WarpSRSSolverImpl(self.cfg, self.device)
+                self._geometry_impl = _CPUSRSSolverImpl(self.cfg, torch.device("cpu"))
+            else:
+                self.impl = _CPUSRSSolverImpl(self.cfg, self.device)
+                self._geometry_impl = self.impl
+            self._update_impl_qpos_limits()
 
     def get_arm_angle(self, qpos: np.ndarray | torch.Tensor) -> float:
         """Measure elbow-plane rotation around the shoulder-to-wrist axis."""
-        joints = np.asarray(torch.as_tensor(qpos).detach().cpu(), dtype=np.float64)
+        joints = np.asarray(_as_tensor(qpos).detach().cpu(), dtype=np.float64)
         if joints.shape != (7,) or not np.all(np.isfinite(joints)):
             raise ValueError("qpos must be a finite array of shape (7,)")
         return self._geometry_impl._get_arm_angle(joints)
 
     def get_configuration(self, qpos: np.ndarray | torch.Tensor) -> SRSConfiguration:
         """Return the current S/E/W branch and continuous arm angle."""
-        joints = np.asarray(torch.as_tensor(qpos).detach().cpu(), dtype=np.float64)
+        joints = np.asarray(_as_tensor(qpos).detach().cpu(), dtype=np.float64)
         if joints.shape != (7,) or not np.all(np.isfinite(joints)):
             raise ValueError("qpos must be a finite array of shape (7,)")
 
@@ -1418,16 +1227,14 @@ class SRSSolver:
         joint_seed: np.ndarray | torch.Tensor | None = None,
     ) -> tuple[bool, torch.Tensor | None]:
         """Solve one explicitly selected branch at an exact arm angle."""
-        target = np.asarray(
-            torch.as_tensor(target_xpos).detach().cpu(), dtype=np.float64
-        )
+        target = np.asarray(_as_tensor(target_xpos).detach().cpu(), dtype=np.float64)
         _validate_pose(target, "target_xpos")
         if not isinstance(configuration, SRSConfiguration):
             raise TypeError("configuration must be an SRSConfiguration")
         seed = (
             np.zeros(7)
             if joint_seed is None
-            else np.asarray(torch.as_tensor(joint_seed).detach().cpu(), dtype=float)
+            else np.asarray(_as_tensor(joint_seed).detach().cpu(), dtype=float)
         )
         if seed.shape != (7,) or not np.all(np.isfinite(seed)):
             raise ValueError("joint_seed must be a finite array of shape (7,)")
@@ -1443,19 +1250,22 @@ class SRSSolver:
         actual = self._geometry_impl._get_fk(joints)
         if not np.allclose(actual, target, atol=1e-4, rtol=0.0):
             return False, None
-        return True, torch.as_tensor(joints, dtype=torch.float32, device=self.device)
+        return True, _as_tensor(joints, dtype=torch.float32, device=self.device)
 
     def _update_impl_qpos_limits(self):
-        qpos_limits = torch.vstack([self.lower_qpos_limits, self.upper_qpos_limits]).T
-        self.impl.qpos_limits_np = qpos_limits.cpu().numpy()
-        if self.use_warp:
-            self.impl.qpos_limits_wp = wp.array(
-                self.impl.qpos_limits_np,
-                dtype=wp.vec2,
-                device=standardize_device_string(self.device),
-            )
-        if hasattr(self, "_geometry_impl"):
-            self._geometry_impl.qpos_limits_np = self.impl.qpos_limits_np.copy()
+        with _torch_stream(self.device):
+            qpos_limits = torch.vstack(
+                [self.lower_qpos_limits, self.upper_qpos_limits]
+            ).T
+            self.impl.qpos_limits_np = qpos_limits.cpu().numpy()
+            if self.use_warp:
+                self.impl.qpos_limits_wp = wp.array(
+                    self.impl.qpos_limits_np,
+                    dtype=wp.vec2,
+                    device=standardize_device_string(self.device),
+                )
+            if hasattr(self, "_geometry_impl"):
+                self._geometry_impl.qpos_limits_np = self.impl.qpos_limits_np.copy()
 
     def solve_configurations(self, target_xpos, configurations, joint_seed=None):
         """Solve exact configurations for one target and shared seed on CPU geometry.
@@ -1464,21 +1274,22 @@ class SRSSolver:
         preserving input order and zeroing invalid rows. Geometry is prepared at
         most once per elbow branch; arm angles and FK validation are batched.
         """
-        target = np.asarray(torch.as_tensor(target_xpos).detach().cpu(), dtype=float)
+        target = np.asarray(_as_tensor(target_xpos).detach().cpu(), dtype=float)
         _validate_pose(target, "target_xpos")
         seed = (
             np.zeros(7)
             if joint_seed is None
-            else np.asarray(torch.as_tensor(joint_seed).detach().cpu(), dtype=float)
+            else np.asarray(_as_tensor(joint_seed).detach().cpu(), dtype=float)
         )
         if seed.shape != (7,) or not np.all(np.isfinite(seed)):
             raise ValueError("joint_seed must be a finite array of shape (7,)")
         configurations = tuple(configurations)
         if any(not isinstance(c, SRSConfiguration) for c in configurations):
             raise TypeError("configurations must contain SRSConfiguration values")
-        output = np.zeros((len(configurations), 7))
-        success = np.zeros(len(configurations), dtype=bool)
-        if configurations:
+        if not configurations:
+            output = np.zeros((0, 7))
+            success = np.zeros(0, dtype=bool)
+        else:
             branches = np.array(
                 [
                     int(c.shoulder < 0)
@@ -1490,34 +1301,17 @@ class SRSSolver:
             angles = np.array([c.redundancy for c in configurations])
             impl = self._geometry_impl
             local = impl._local_target(target)
-            geometry = {}
-            for branch in np.unique(branches):
-                elbow = impl._configuration(branch)[1]
-                if elbow not in geometry:
-                    geometry[elbow] = impl._prepare_ik(local, elbow)
-                if geometry[elbow] is None:
-                    continue
-                rows = np.flatnonzero(branches == branch)
-                candidates = (
-                    impl._candidate_joint_angles(
-                        geometry[elbow],
-                        angles[rows],
-                        branch,
-                        seed * impl.rotation_directions_np,
-                    )
-                    * impl.rotation_directions_np
-                )
-                candidates, valid = impl._map_to_limits(candidates, seed)
-                output[rows[valid]] = candidates[valid]
-                success[rows] = valid
+            success, output = impl._configuration_candidates(
+                local, angles, branches, seed
+            )
             rows = np.flatnonzero(success)
             if len(rows):
                 actual = impl._get_fk(output[rows])
                 success[rows] = np.all(np.abs(actual - target) <= 1e-4, axis=(-2, -1))
             output[~success] = 0
         return (
-            torch.as_tensor(success, device=self.device),
-            torch.as_tensor(output, dtype=torch.float32, device=self.device),
+            _as_tensor(success, device=self.device),
+            _as_tensor(output, dtype=torch.float32, device=self.device),
         )
 
     def update_with_robot_limit(self, robot_qpos_limits):
@@ -1543,39 +1337,47 @@ class SRSSolver:
         Warp execution launches one thread per robot.  The result always
         has shape ``(N, 4, 4)`` on the solver device.
         """
-        qpos_tensor = torch.as_tensor(qpos, dtype=torch.float32, device=self.device)
+        qpos_tensor = _as_tensor(qpos, dtype=torch.float32, device=self.device)
         if qpos_tensor.ndim == 1:
             qpos_tensor = qpos_tensor.unsqueeze(0)
         if qpos_tensor.ndim != 2 or qpos_tensor.shape[1] != 7:
             raise ValueError("qpos must have shape (7,) or (N, 7)")
-        if not bool(torch.isfinite(qpos_tensor).all()):
-            raise ValueError("qpos must contain only finite values")
-
         if qpos_tensor.shape[0] == 0:
             return torch.empty((0, 4, 4), dtype=qpos_tensor.dtype, device=self.device)
         if not self.use_warp:
+            if not bool(torch.isfinite(qpos_tensor).all()):
+                raise ValueError("qpos must contain only finite values")
             poses = self.impl._get_fk(qpos_tensor.detach().cpu().numpy())
-            return torch.as_tensor(poses, dtype=qpos_tensor.dtype, device=self.device)
+            return _as_tensor(poses, dtype=qpos_tensor.dtype, device=self.device)
 
-        warp_device = standardize_device_string(self.device)
-        joint_angles = wp.from_torch(qpos_tensor.contiguous().flatten())
-        poses = wp.empty(qpos_tensor.shape[0], dtype=wp.mat44, device=warp_device)
-        success = wp.empty(qpos_tensor.shape[0], dtype=int, device=warp_device)
-        wp.launch(
-            compute_fk_kernel,
-            dim=qpos_tensor.shape[0],
-            inputs=[
-                joint_angles,
-                self.impl.dh_params_wp,
-                self.impl.rotation_directions_wp,
-                wp.mat44(*np.asarray(self.cfg.T_b_ob).flatten()),
-                wp.mat44(*np.asarray(self.cfg.T_e_oe).flatten()),
-                wp.mat44(*np.asarray(self.cfg.tcp).flatten()),
-            ],
-            outputs=[poses, success],
-            device=warp_device,
-        )
-        return wp.to_torch(poses).view(-1, 4, 4)
+        with _torch_stream(self.device):
+            warp_device = standardize_device_string(self.device)
+            joint_angles = wp.from_torch(qpos_tensor.contiguous().flatten())
+            poses = torch.empty(
+                (qpos_tensor.shape[0], 4, 4),
+                dtype=qpos_tensor.dtype,
+                device=self.device,
+            )
+            success = torch.empty(
+                qpos_tensor.shape[0], dtype=torch.int32, device=self.device
+            )
+            wp.launch(
+                compute_fk_kernel,
+                dim=qpos_tensor.shape[0],
+                inputs=[
+                    joint_angles,
+                    self.impl.dh_params_wp,
+                    self.impl.rotation_directions_wp,
+                    wp.mat44(*np.asarray(self.cfg.T_b_ob).flatten()),
+                    wp.mat44(*np.asarray(self.cfg.T_e_oe).flatten()),
+                    wp.mat44(*np.asarray(self.cfg.tcp).flatten()),
+                ],
+                outputs=[wp.from_torch(poses, dtype=wp.mat44), wp.from_torch(success)],
+                device=warp_device,
+            )
+            if not bool(success.all()):
+                raise ValueError("qpos must contain only finite values")
+            return poses
 
     def get_all_fk_mat(self, qpos: np.ndarray | torch.Tensor) -> torch.Tensor:
         """Return (N, 8, 4, 4): seven DH link frames followed by the TCP.
@@ -1583,7 +1385,7 @@ class SRSSolver:
         All poses are in world coordinates. Accepts (7,) or (N, 7), including
         empty batches. Each call owns its outputs, so later calls cannot overwrite them.
         """
-        joints = torch.as_tensor(qpos, dtype=torch.float32, device=self.device)
+        joints = _as_tensor(qpos, dtype=torch.float32, device=self.device)
         if joints.ndim == 1:
             joints = joints.unsqueeze(0)
         if (
@@ -1596,34 +1398,32 @@ class SRSSolver:
         if count == 0:
             return torch.empty((0, 8, 4, 4), dtype=joints.dtype, device=self.device)
         if self.use_warp:
-            output = wp.empty(
-                count * 8, dtype=wp.mat44, device=standardize_device_string(self.device)
-            )
-            wp.launch(
-                compute_fk_chain_kernel,
-                dim=count,
-                inputs=[
-                    wp.from_torch(joints.contiguous().flatten()),
-                    self.impl.dh_params_wp,
-                    self.impl.rotation_directions_wp,
-                    wp.mat44(*self.cfg.T_b_ob.ravel()),
-                    wp.mat44(*(self.cfg.T_e_oe @ self.cfg.tcp).ravel()),
-                ],
-                outputs=[output],
-                device=standardize_device_string(self.device),
-            )
-            return wp.to_torch(output).view(count, 8, 4, 4)
+            with _torch_stream(self.device):
+                output = torch.empty(
+                    (count, 8, 4, 4), dtype=joints.dtype, device=self.device
+                )
+                wp.launch(
+                    compute_fk_chain_kernel,
+                    dim=count,
+                    inputs=[
+                        wp.from_torch(joints.contiguous().flatten()),
+                        self.impl.dh_params_wp,
+                        self.impl.rotation_directions_wp,
+                        wp.mat44(*self.cfg.T_b_ob.ravel()),
+                        wp.mat44(*(self.cfg.T_e_oe @ self.cfg.tcp).ravel()),
+                    ],
+                    outputs=[wp.from_torch(output.view(-1, 4, 4), dtype=wp.mat44)],
+                    device=standardize_device_string(self.device),
+                )
+                return output
         physical = joints.detach().cpu().numpy() * self.cfg.rotation_directions
-        transforms = self.impl._joint_transforms(physical)
-        pose = np.broadcast_to(self.cfg.T_b_ob, (count, 4, 4)).copy()
-        poses = []
-        for index in range(7):
-            pose = pose @ transforms[:, index]
-            poses.append(pose)
-        poses.append(pose @ self.cfg.T_e_oe @ self.cfg.tcp)
-        return torch.as_tensor(
-            np.stack(poses, axis=1), dtype=joints.dtype, device=self.device
-        )
+        pose = np.broadcast_to(self.cfg.T_b_ob, (count, 4, 4))
+        poses = np.empty((count, 8, 4, 4))
+        for index, transform in enumerate(self.impl._iter_joint_transforms(physical)):
+            pose = pose @ transform
+            poses[:, index] = pose
+        poses[:, 7] = pose @ self.cfg.T_e_oe @ self.cfg.tcp
+        return _as_tensor(poses, dtype=joints.dtype, device=self.device)
 
     def get_jacobian(
         self, qpos: np.ndarray | torch.Tensor, step: float = 1e-4
@@ -1634,7 +1434,7 @@ class SRSSolver:
         """
         if not np.isfinite(step) or step <= 0:
             raise ValueError("step must be positive and finite")
-        joints = torch.as_tensor(qpos, dtype=torch.float32, device=self.device)
+        joints = _as_tensor(qpos, dtype=torch.float32, device=self.device)
         squeeze = joints.ndim == 1
         if squeeze:
             joints = joints.unsqueeze(0)
@@ -1646,35 +1446,38 @@ class SRSSolver:
             raise ValueError("qpos must be finite and have shape (7,) or (N, 7)")
         batch = joints.shape[0]
         if self.use_warp:
-            output = torch.empty((batch, 6, 7), dtype=joints.dtype, device=self.device)
-            if batch:
-                wp.launch(
-                    compute_jacobian_kernel,
-                    dim=batch,
-                    inputs=[
-                        wp.from_torch(joints.contiguous().flatten()),
-                        self.impl.dh_params_wp,
-                        self.impl.rotation_directions_wp,
-                        wp.mat44(*np.asarray(self.cfg.T_b_ob).ravel()),
-                        wp.mat44(*(self.cfg.T_e_oe @ self.cfg.tcp).ravel()),
-                    ],
-                    outputs=[wp.from_torch(output.flatten())],
-                    device=standardize_device_string(self.device),
+            with _torch_stream(self.device):
+                output = torch.empty(
+                    (batch, 6, 7), dtype=joints.dtype, device=self.device
                 )
+                if batch:
+                    wp.launch(
+                        compute_jacobian_kernel,
+                        dim=batch,
+                        inputs=[
+                            wp.from_torch(joints.contiguous().flatten()),
+                            self.impl.dh_params_wp,
+                            self.impl.rotation_directions_wp,
+                            wp.mat44(*np.asarray(self.cfg.T_b_ob).ravel()),
+                            wp.mat44(*(self.cfg.T_e_oe @ self.cfg.tcp).ravel()),
+                        ],
+                        outputs=[wp.from_torch(output.flatten())],
+                        device=standardize_device_string(self.device),
+                    )
         else:
             q = joints.detach().cpu().numpy() * self.cfg.rotation_directions
-            transforms = self.impl._joint_transforms(q)
-            pose = np.broadcast_to(self.cfg.T_b_ob, (batch, 4, 4)).copy()
-            origins, axes = [], []
-            for index in range(7):
-                origins.append(pose[:, :3, 3])
-                axes.append(pose[:, :3, 2] * self.cfg.rotation_directions[index])
-                pose = pose @ transforms[:, index]
+            pose = np.broadcast_to(self.cfg.T_b_ob, (batch, 4, 4))
+            origins, axes = np.empty((batch, 7, 3)), np.empty((batch, 7, 3))
+            for index, transform in enumerate(self.impl._iter_joint_transforms(q)):
+                origins[:, index] = pose[:, :3, 3]
+                axes[:, index] = pose[:, :3, 2] * self.cfg.rotation_directions[index]
+                pose = pose @ transform
             tcp = (pose @ self.cfg.T_e_oe @ self.cfg.tcp)[:, :3, 3]
-            axes = np.stack(axes, axis=1)
-            linear = np.cross(axes, tcp[:, None] - np.stack(origins, axis=1))
-            jacobian = np.concatenate((linear, axes), axis=-1).transpose(0, 2, 1)
-            output = torch.as_tensor(jacobian, dtype=joints.dtype, device=self.device)
+            linear = np.cross(axes, tcp[:, None] - origins)
+            jacobian = np.empty((batch, 6, 7))
+            jacobian[:, :3] = linear.transpose(0, 2, 1)
+            jacobian[:, 3:] = axes.transpose(0, 2, 1)
+            output = _as_tensor(jacobian, dtype=joints.dtype, device=self.device)
         return output[0] if squeeze else output
 
     def get_null_space_velocity(
@@ -1687,7 +1490,7 @@ class SRSSolver:
         squeeze = jacobian.ndim == 2
         if squeeze:
             jacobian = jacobian.unsqueeze(0)
-        preferred = torch.as_tensor(
+        preferred = _as_tensor(
             preferred_velocity, dtype=jacobian.dtype, device=self.device
         )
         if preferred.ndim == 1:
@@ -1696,13 +1499,20 @@ class SRSSolver:
             raise ValueError("preferred_velocity must have shape (7,) or (N, 7)")
         if not bool(torch.isfinite(preferred).all()):
             raise ValueError("preferred_velocity must contain finite values")
-        projector = (
-            torch.eye(7, dtype=jacobian.dtype, device=self.device).expand(
-                jacobian.shape[0], -1, -1
-            )
-            - torch.linalg.pinv(jacobian) @ jacobian
+        # Project through orthonormal null-space vectors directly. Forming
+        # I - pinv(J) @ J amplifies roundoff when J is nearly singular.
+        _, singular, vh = torch.linalg.svd(jacobian, full_matrices=True)
+        cutoff = (
+            singular[:, :1] * max(jacobian.shape[-2:]) * torch.finfo(jacobian.dtype).eps
         )
-        velocity = (projector @ preferred.unsqueeze(-1)).squeeze(-1)
+        null = torch.cat(
+            (singular <= cutoff, torch.ones_like(singular[:, :1], dtype=torch.bool)),
+            dim=1,
+        )
+        # Elementwise reductions preserve float32 inside the caller's autocast scope.
+        coefficients = (vh * preferred[:, None, :]).sum(dim=2)
+        coefficients = coefficients.masked_fill(~null, 0.0)
+        velocity = (vh * coefficients[:, :, None]).sum(dim=1)
         return velocity[0] if squeeze else velocity
 
     def get_null_space_direction(self, qpos: np.ndarray | torch.Tensor) -> torch.Tensor:
@@ -1748,60 +1558,32 @@ class SRSSolver:
             raise ValueError(
                 "Warp batch IK supports search_mode='global'; continuous mode uses the NumPy backend"
             )
-        target_xpos = torch.as_tensor(
-            target_xpos, dtype=torch.float32, device=self.device
-        )
+        target_xpos = _as_tensor(target_xpos, dtype=torch.float32, device=self.device)
         if target_xpos.ndim == 2:
             target_xpos = target_xpos.unsqueeze(0)
         if target_xpos.ndim != 3 or target_xpos.shape[1:] != (4, 4):
             raise ValueError("target_xpos must have shape (4, 4) or (N, 4, 4)")
-        if not bool(torch.isfinite(target_xpos).all()):
-            raise ValueError("target_xpos must contain only finite values")
-        rotation = target_xpos[:, :3, :3]
-        identity = torch.eye(3, dtype=target_xpos.dtype, device=self.device)
-        bottom = torch.tensor([0, 0, 0, 1], dtype=target_xpos.dtype, device=self.device)
-        if (
-            not torch.allclose(
-                target_xpos[:, 3],
-                bottom.expand(target_xpos.shape[0], -1),
-                atol=1e-6,
-                rtol=0,
-            )
-            or not torch.allclose(
-                rotation.transpose(1, 2) @ rotation,
-                identity.expand(target_xpos.shape[0], -1, -1),
-                atol=1e-6,
-                rtol=0,
-            )
-            or not torch.allclose(
-                torch.linalg.det(rotation),
-                torch.ones(target_xpos.shape[0], device=self.device),
-                atol=1e-6,
-                rtol=0,
-            )
-        ):
-            raise ValueError("target_xpos must contain rigid homogeneous transforms")
         if qpos_seed is not None:
-            qpos_seed = torch.as_tensor(
-                qpos_seed, dtype=torch.float32, device=self.device
-            )
+            qpos_seed = _as_tensor(qpos_seed, dtype=torch.float32, device=self.device)
             if qpos_seed.ndim == 1:
                 qpos_seed = qpos_seed.unsqueeze(0)
             if qpos_seed.shape != (target_xpos.shape[0], 7):
                 raise ValueError("qpos_seed must have shape (7,) or (N, 7)")
-            if not bool(torch.isfinite(qpos_seed).all()):
-                raise ValueError("qpos_seed must contain only finite values")
+            qpos_seed = qpos_seed.contiguous()
+        target_xpos = target_xpos.contiguous()
         if target_xpos.shape[0] == 0:
             slots = 8 * self.cfg.num_samples if return_all_solutions else 1
-            return torch.empty(0, dtype=torch.bool, device=self.device), torch.empty(
-                (0, slots, 7), device=self.device
+            return torch.empty(
+                0, dtype=torch.bool, device=self.device
+            ), target_xpos.new_empty((0, slots, 7))
+        with _torch_stream(self.device):
+            self.impl._validate_inputs(target_xpos, qpos_seed)
+            return self.impl.get_ik(
+                target_xpos=target_xpos.contiguous(),
+                qpos_seed=qpos_seed,
+                return_all_solutions=return_all_solutions,
+                search_mode=search_mode,
             )
-        return self.impl.get_ik(
-            target_xpos=target_xpos.contiguous(),
-            qpos_seed=qpos_seed,
-            return_all_solutions=return_all_solutions,
-            search_mode=search_mode,
-        )
 
 
 def get_iiwa_urdf_path() -> str:

@@ -1,0 +1,140 @@
+{
+  "date_utc": "2026-11-04",
+  "before_commit": "b88dec1d55dd3db781577eccb80d22d81ec7e746",
+  "environment": {
+    "python": "3.10.0",
+    "numpy": "2.2.6",
+    "torch": "2.13.0",
+    "warp-lang": "1.16.0",
+    "gpu": "NVIDIA GeForce RTX 5090 D v2"
+  },
+  "batch_size": 64,
+  "num_samples": 73,
+  "repeats_per_strategy_device": 3,
+  "driver_cache_disabled": true,
+  "scope": "Separate processes with empty Warp cache directories and CUDA_CACHE_DISABLE=1. Imports excluded; constructor/first FK includes device initialization. Through-first-IK adds remaining compilation and the first global solve. All 64 targets pass FK residual checks.",
+  "medians": [
+    {
+      "device": "cpu",
+      "strategy": "before",
+      "constructor_first_fk_seconds": 4.611174981924705,
+      "through_first_ik_seconds": 4.621136641944759
+    },
+    {
+      "device": "cpu",
+      "strategy": "after",
+      "constructor_first_fk_seconds": 2.125669948058203,
+      "through_first_ik_seconds": 3.915837927022949
+    },
+    {
+      "device": "cuda",
+      "strategy": "before",
+      "constructor_first_fk_seconds": 20.370720563922077,
+      "through_first_ik_seconds": 20.420945695019327
+    },
+    {
+      "device": "cuda",
+      "strategy": "after",
+      "constructor_first_fk_seconds": 2.231052453047596,
+      "through_first_ik_seconds": 8.738288457039744
+    }
+  ],
+  "trials": [
+    {
+      "strategy": "after",
+      "device": "cpu",
+      "constructor_first_fk_seconds": 2.148495289031416,
+      "additional_first_ik_seconds": 1.7180283250054345,
+      "valid": 64,
+      "trial": 21
+    },
+    {
+      "strategy": "before",
+      "device": "cpu",
+      "constructor_first_fk_seconds": 4.501051435014233,
+      "additional_first_ik_seconds": 0.009956800029613078,
+      "valid": 64,
+      "trial": 21
+    },
+    {
+      "strategy": "before",
+      "device": "cpu",
+      "constructor_first_fk_seconds": 4.611174981924705,
+      "additional_first_ik_seconds": 0.009961660020053387,
+      "valid": 64,
+      "trial": 22
+    },
+    {
+      "strategy": "after",
+      "device": "cpu",
+      "constructor_first_fk_seconds": 2.0995860990369692,
+      "additional_first_ik_seconds": 1.8287356831133366,
+      "valid": 64,
+      "trial": 22
+    },
+    {
+      "strategy": "after",
+      "device": "cpu",
+      "constructor_first_fk_seconds": 2.125669948058203,
+      "additional_first_ik_seconds": 1.790167978964746,
+      "valid": 64,
+      "trial": 23
+    },
+    {
+      "strategy": "before",
+      "device": "cpu",
+      "constructor_first_fk_seconds": 4.6720677020493895,
+      "additional_first_ik_seconds": 0.01021695404779166,
+      "valid": 64,
+      "trial": 23
+    },
+    {
+      "strategy": "after",
+      "device": "cuda",
+      "constructor_first_fk_seconds": 2.231052453047596,
+      "additional_first_ik_seconds": 6.507236003992148,
+      "valid": 64,
+      "trial": 21
+    },
+    {
+      "strategy": "before",
+      "device": "cuda",
+      "constructor_first_fk_seconds": 19.894448276027106,
+      "additional_first_ik_seconds": 0.05066550790797919,
+      "valid": 64,
+      "trial": 21
+    },
+    {
+      "strategy": "before",
+      "device": "cuda",
+      "constructor_first_fk_seconds": 20.370720563922077,
+      "additional_first_ik_seconds": 0.05022513109724969,
+      "valid": 64,
+      "trial": 22
+    },
+    {
+      "strategy": "after",
+      "device": "cuda",
+      "constructor_first_fk_seconds": 2.2992238419828936,
+      "additional_first_ik_seconds": 6.272356308996677,
+      "valid": 64,
+      "trial": 22
+    },
+    {
+      "strategy": "after",
+      "device": "cuda",
+      "constructor_first_fk_seconds": 2.2129612780408934,
+      "additional_first_ik_seconds": 6.724616882042028,
+      "valid": 64,
+      "trial": 23
+    },
+    {
+      "strategy": "before",
+      "device": "cuda",
+      "constructor_first_fk_seconds": 25.95033128000796,
+      "additional_first_ik_seconds": 0.06922980793751776,
+      "valid": 64,
+      "trial": 23
+    }
+  ]
+}

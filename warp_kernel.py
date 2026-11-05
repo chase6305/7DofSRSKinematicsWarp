@@ -1,4 +1,16 @@
+from functools import partial
+import inspect
+
 import warp as wp
+
+# Compile only the requested kernel and its dependencies, so a first FK call
+# does not also compile the much larger IK kernels. Older Warp releases (1.5)
+# lack this decorator option and retain their original module registration.
+_kernel = (
+    partial(wp.kernel, module="unique")
+    if "module" in inspect.signature(wp.kernel).parameters
+    else wp.kernel
+)
 
 
 @wp.func
@@ -27,13 +39,6 @@ def identity_mat33() -> wp.mat33:
 @wp.func
 def safe_acos(x: float) -> float:
     return wp.acos(wp.clamp(x, -1.0, 1.0))
-
-
-@wp.func
-def safe_division(numerator: float, denominator: float, eps: float = 1e-10) -> float:
-    if wp.abs(denominator) < eps:
-        return 0.0
-    return numerator / denominator
 
 
 @wp.func
@@ -102,181 +107,25 @@ def transform_pose(
     return T_b_ob_inv @ target_xpos @ tcp_inv @ T_e_oe_inv
 
 
-@wp.kernel
-def transform_pose_kernel(
-    target_xpos: wp.array(dtype=wp.mat44),
-    T_b_ob_inv: wp.mat44,
-    T_e_oe_inv: wp.mat44,
-    tcp_inv: wp.mat44,
-    output: wp.array(dtype=wp.mat44),
-):
-    """
-    Transform a batch of target poses to the TCP frame.
-
-    Args:
-        target_xpos (wp.array): Batch of target pose matrices.
-        T_b_ob_inv (wp.mat44): Inverse base-to-object transform.
-        tcp_inv (wp.mat44): Inverse TCP transform.
-        T_e_oe_inv (wp.mat44): Inverse end-effector transform.
-        output (wp.array): Output array for transformed poses.
-    """
-    tid = wp.tid()
-    output[tid] = T_b_ob_inv @ target_xpos[tid] @ tcp_inv @ T_e_oe_inv
-
-
 @wp.func
-def calculate_arm_joint_angles(
-    P_s_to_w: wp.vec3,
-    elbow_GC4: float,
-    link_lengths: wp.array(dtype=float),
-    res: wp.array(dtype=int),
-    joints: wp.array(dtype=wp.vec4),
-    tid: int,
-):
-    """
-    Compute joint angles for a 3-DOF arm given the shoulder-to-wrist vector.
-
-    Args:
-        P_s_to_w (wp.vec3): Shoulder-to-wrist vector.
-        elbow_GC4 (float): Elbow configuration, typically ±1.
-        link_lengths (wp.array): [d_bs, d_se, d_ew] for each segment length.
-        res (wp.array): Output success flag.
-        joints (wp.array): Output joint angles.
-        tid (int): Thread index.
-    """
-    d_se = link_lengths[1]
-    d_ew = link_lengths[2]
-
-    # Extract components
-    x, y, z = P_s_to_w.x, P_s_to_w.y, P_s_to_w.z
-    horizontal_distance = wp.length(wp.vec2(x, y))
-    shoulder_to_wrist_length = wp.length(P_s_to_w)
-
-    # Initialize joint values
-    joints_val = wp.vec4()
-
-    # Check reachability
-    if (
-        shoulder_to_wrist_length > d_se + d_ew + 1.0e-6
-        or shoulder_to_wrist_length < wp.abs(d_se - d_ew) - 1.0e-6
-        or shoulder_to_wrist_length < 1.0e-8
-    ):
-        res[tid] = 0
-        joints[tid] = joints_val
-        return
-
-    # Compute elbow angle
-    elbow_cos_angle = (
-        wp.pow(shoulder_to_wrist_length, 2.0) - wp.pow(d_se, 2.0) - wp.pow(d_ew, 2.0)
-    ) / (2.0 * d_se * d_ew)
-    if wp.abs(elbow_cos_angle) > 1.0 + 1.0e-6:
-        res[tid] = 0
-        joints[tid] = joints_val
-        return
-
-    joints_val[3] = elbow_GC4 * safe_acos(elbow_cos_angle)
-
-    # Compute shoulder angle
-    joints_val[0] = wp.atan2(y, x) if horizontal_distance > 1.0e-10 else 0.0
-
-    # Compute joint 2 angle
-    angle_phi = safe_acos(
-        (wp.pow(d_se, 2.0) + wp.pow(shoulder_to_wrist_length, 2.0) - wp.pow(d_ew, 2.0))
-        / (2.0 * d_se * shoulder_to_wrist_length)
-    )
-    joints_val[1] = wp.atan2(horizontal_distance, z) + elbow_GC4 * angle_phi
-
-    # Set success flag and output joint values
-    res[tid] = 1
-    joints[tid] = joints_val
-
-
-@wp.func
-def compute_reference_plane(
-    pose: wp.mat44,
-    elbow_GC4: float,
-    link_lengths: wp.array(dtype=float),
+def joint_dh_transform(
+    joint_angles: wp.array(dtype=float),
     dh_params: wp.array(dtype=float),
-    res: wp.array(dtype=int),
-    plane_normal: wp.array(dtype=wp.vec3),
-    base_to_elbow_rotation: wp.array(dtype=wp.mat33),
-    joints: wp.array(dtype=wp.vec4),
-    tid: int,
-):
-    """
-    Compute the reference plane normal, base-to-elbow rotation, and joint angles.
-
-    Args:
-        pose (wp.mat44): Target pose matrix (4x4).
-        elbow_GC4 (float): Elbow configuration, typically ±1.
-        link_lengths (wp.array): Link lengths, at least [d_bs, d_se, d_ew, d_hand].
-        dh_params (wp.array): DH parameters, shape [num_joints * 4].
-        res (wp.array): Output success flag.
-        plane_normal (wp.array): Output plane normal vector.
-        base_to_elbow_rotation (wp.array): Output base-to-elbow rotation matrix.
-        joints (wp.array): Output joint angles.
-        tid (int): Thread index.
-    """
-    # Extract position and rotation
-    P_target = wp.vec3(pose[0, 3], pose[1, 3], pose[2, 3])
-    # fmt: off
-    R_target = wp.mat33(
-        pose[0, 0], pose[0, 1], pose[0, 2],
-        pose[1, 0], pose[1, 1], pose[1, 2],
-        pose[2, 0], pose[2, 1], pose[2, 2],
+    rotation_directions: wp.array(dtype=float),
+    robot_offset: int,
+    joint: int,
+) -> wp.mat44:
+    offset = joint * 4
+    return dh_transform(
+        dh_params[offset],
+        dh_params[offset + 1],
+        dh_params[offset + 2],
+        dh_params[offset + 3]
+        + joint_angles[robot_offset + joint] * rotation_directions[joint],
     )
-    # fmt: on
-
-    # Base to shoulder
-    P02 = wp.vec3(0.0, 0.0, link_lengths[0])
-    P67 = wp.vec3(0.0, 0.0, dh_params[6 * 4 + 0])
-
-    # Wrist position
-    P06 = P_target - R_target @ P67
-    # Shoulder to wrist
-    P26 = P06 - P02
-
-    # Calculate joint angles
-    calculate_arm_joint_angles(P26, elbow_GC4, link_lengths, res, joints, tid)
-    if res[tid] == 0:
-        plane_normal[tid] = wp.vec3()
-        base_to_elbow_rotation[tid] = identity_mat33()
-        joints[tid] = wp.vec4()
-        return
-
-    # Lower arm transformation (joint 4)
-    T34 = dh_transform(
-        dh_params[3 * 4 + 0], dh_params[3 * 4 + 1], dh_params[3 * 4 + 2], 0.0
-    )
-    P34 = wp.vec3(T34[0, 3], T34[1, 3], T34[2, 3])
-
-    # Reference plane normal
-    v1 = wp.normalize(P34 - P02)
-    v2 = wp.normalize(P06 - P02)
-    plane_normal[tid] = wp.cross(v1, v2)
-
-    # Compute base-to-elbow rotation
-    base_to_elbow_rotation[tid] = identity_mat33()
-    for i in range(3):
-        base_idx = i * 4
-        T = dh_transform(
-            dh_params[base_idx + 0],
-            dh_params[base_idx + 1],
-            dh_params[base_idx + 2],
-            joints[tid][i],
-        )
-        # fmt: off
-        base_to_elbow_rotation[tid] = base_to_elbow_rotation[tid] @ wp.mat33(
-            T[0, 0], T[0, 1], T[0, 2],
-            T[1, 0], T[1, 1], T[1, 2],
-            T[2, 0], T[2, 1], T[2, 2],
-        )
-        # fmt: on
-
-    res[tid] = 1
 
 
-@wp.kernel
+@_kernel
 def compute_fk_kernel(
     joint_angles: wp.array(dtype=float),
     dh_params: wp.array(dtype=float),
@@ -300,23 +149,34 @@ def compute_fk_kernel(
         tcp_transform (wp.mat44): Tool center point (TCP) transformation matrix.
         pose_out (wp.array): Output array for computed poses ([N, 4x4]).
         success (wp.array): Output array indicating whether FK computation was successful ([N]).
+
+    Nonfinite joint rows receive a zero pose and success=0. Finite rows retain
+    the same DH computation, with validation in the same kernel launch.
+    Seven-joint chains are unrolled to preserve intermediate values for Warp
+    Tape gradients. Other joint counts retain the generic forward traversal.
     """
     tid = wp.tid()
     num_joints = rotation_directions.shape[0]
 
-    # Initialize pose as identity matrix
-    pose = identity_mat44()
-
-    # Loop through each joint and apply DH transformation
     for i in range(num_joints):
-        base_idx = i * 4
-        d = dh_params[base_idx + 0]
-        alpha = dh_params[base_idx + 1]
-        a = dh_params[base_idx + 2]
-        theta = dh_params[base_idx + 3]
-        theta += joint_angles[tid * num_joints + i] * rotation_directions[i]
-        T = dh_transform(d, alpha, a, theta)
-        pose = pose @ T
+        angle = joint_angles[tid * num_joints + i]
+        if not wp.isfinite(angle):
+            pose_out[tid] = wp.mat44()
+            success[tid] = 0
+            return
+
+    pose = identity_mat44()
+    if num_joints == 7:
+        # A fixed bound lets Warp retain each primal pose for reverse mode.
+        for i in range(7):
+            pose = pose @ joint_dh_transform(
+                joint_angles, dh_params, rotation_directions, tid * 7, i
+            )
+    else:
+        for i in range(num_joints):
+            pose = pose @ joint_dh_transform(
+                joint_angles, dh_params, rotation_directions, tid * num_joints, i
+            )
 
     # Apply additional transforms: base, end-effector, TCP
     pose = T_b_ob @ pose @ T_oe_e @ tcp_transform
@@ -326,7 +186,7 @@ def compute_fk_kernel(
     success[tid] = 1
 
 
-@wp.kernel
+@_kernel
 def compute_fk_chain_kernel(
     joint_angles: wp.array(dtype=float),
     dh_params: wp.array(dtype=float),
@@ -354,7 +214,7 @@ def compute_fk_chain_kernel(
 mat73 = wp.types.matrix(shape=(7, 3), dtype=wp.float32)
 
 
-@wp.kernel
+@_kernel
 def compute_jacobian_kernel(
     joint_angles: wp.array(dtype=float),
     dh_params: wp.array(dtype=float),
@@ -529,62 +389,87 @@ def validate_fk_with_target(
     pose_error = frobenius_norm(pose_diff)
 
     # Validate against tolerance
-    return 1 if pose_error <= tolerance else 0
+    if pose_error <= tolerance:
+        return 1
+    return 0
 
 
-# TODO: automatic gradient support
-@wp.kernel
-def compute_ik_kernel(
-    target_xpos_list: wp.array(dtype=wp.mat44),
-    angles_list: wp.array(dtype=float),
-    qpos_limits: wp.array(dtype=wp.vec2),
-    configs: wp.array(dtype=wp.vec3),
+@_kernel
+def validate_ik_inputs_kernel(
+    targets: wp.array(dtype=wp.mat44),
+    seeds: wp.array(dtype=float),
+    has_seed: int,
+    error: wp.array(dtype=int),
+):
+    """Validate finite/rigid inputs in one device pass; larger errors take priority."""
+    tid = wp.tid()
+    target = targets[tid]
+    finite = True
+    for row in range(4):
+        for column in range(4):
+            if not wp.isfinite(target[row, column]):
+                finite = False
+    if not finite:
+        wp.atomic_max(error, 0, 3)
+        return
+    code = int(0)
+    for column in range(4):
+        expected = 0.0
+        if column == 3:
+            expected = 1.0
+        if wp.abs(target[3, column] - expected) > 1.0e-6:
+            code = 2
+    for row in range(3):
+        for column in range(3):
+            dot = 0.0
+            for inner in range(3):
+                dot += target[inner, row] * target[inner, column]
+            expected = 0.0
+            if row == column:
+                expected = 1.0
+            if wp.abs(dot - expected) > 1.0e-6:
+                code = 2
+    rotation = wp.mat33(
+        target[0, 0],
+        target[0, 1],
+        target[0, 2],
+        target[1, 0],
+        target[1, 1],
+        target[1, 2],
+        target[2, 0],
+        target[2, 1],
+        target[2, 2],
+    )
+    if wp.abs(wp.determinant(rotation) - 1.0) > 1.0e-6:
+        code = 2
+    if has_seed != 0:
+        for joint in range(7):
+            if not wp.isfinite(seeds[tid * 7 + joint]):
+                code = wp.max(code, 1)
+    if code != 0:
+        wp.atomic_max(error, 0, code)
+
+
+@wp.struct
+class IKGeometry:
+    As: wp.mat33
+    Bs: wp.mat33
+    Cs: wp.mat33
+    Aw: wp.mat33
+    Bw: wp.mat33
+    Cw: wp.mat33
+    q4: float
+    valid: int
+
+
+@wp.func
+def prepare_ik_geometry(
+    target_xpos: wp.mat44,
+    elbow_config: float,
     dh_params: wp.array(dtype=float),
     link_lengths: wp.array(dtype=float),
-    rotation_directions: wp.array(dtype=float),
-    joint_seeds: wp.array(dtype=float),
-    nearest_weights: wp.array(dtype=float),
-    success: wp.array(dtype=int),
-    qpos_out: wp.array(dtype=float),
-):
-    """
-    Compute inverse kinematics (IK) in parallel for multiple target poses.
-
-    Args:
-        target_xpos_list (wp.array): Array of target poses (4x4 transformation matrices).
-        angles_list (wp.array): Array of reference angles for IK computation.
-        qpos_limits (wp.array): Array of joint position limits (min, max) for each joint.
-        configs (wp.array): Array of configuration vectors (shoulder, elbow, wrist).
-        dh_params (wp.array): Denavit-Hartenberg parameters for the robot.
-        link_lengths (wp.array): Array of link lengths for the robot arm.
-        rotation_directions (wp.array): Array of rotation direction multipliers for each joint.
-        success (wp.array): Output array indicating whether IK computation was successful.
-        qpos_out (wp.array): Output array for computed joint positions.
-
-    Notes:
-        This kernel computes the inverse kinematics for a batch of target poses in parallel.
-        It validates the computed joint positions against joint limits and the target pose.
-        Successful solutions are stored in the output arrays.
-    """
-    tid = wp.tid()  # Thread ID (for batch processing, if needed)
-
-    # Extract indices
-    num_angles = angles_list.shape[0]
-    num_configs = configs.shape[0]
-    solutions_per_target = num_configs * num_angles
-    target_idx = tid // solutions_per_target
-    local_idx = tid - target_idx * solutions_per_target
-    config_idx = local_idx // num_angles
-    angle_idx = local_idx - config_idx * num_angles
-
-    # Load inputs
-    target_xpos = target_xpos_list[target_idx]
-    config = configs[config_idx]
-    angle_ref = angles_list[angle_idx]
-
-    # Extract shoulder, elbow, wrist configurations
-    shoulder_config, elbow_config, wrist_config = config.x, config.y, config.z
-
+) -> IKGeometry:
+    geometry = IKGeometry()
     # Transform target pose (xpos_ = target_xpos @ tcp_inv @ T_e_oe_inv)
     # fmt: off
     P_target = wp.vec3(target_xpos[0, 3], target_xpos[1, 3], target_xpos[2, 3])
@@ -601,8 +486,6 @@ def compute_ik_kernel(
     P06 = P_target - R_target @ P67
     P26 = P06 - P02
 
-    # Reference-plane geometry is kept thread-local. Older versions wrote
-    # four large temporary arrays, which dominated memory for large batches.
     shoulder_to_wrist_length = wp.length(P26)
     d_se = link_lengths[1]
     d_ew = link_lengths[2]
@@ -611,17 +494,17 @@ def compute_ik_kernel(
         or shoulder_to_wrist_length < wp.abs(d_se - d_ew) - 1.0e-6
         or shoulder_to_wrist_length < 1.0e-8
     ):
-        success[tid] = 0
-        return
+        return geometry
     elbow_cos = (
         shoulder_to_wrist_length * shoulder_to_wrist_length - d_se * d_se - d_ew * d_ew
     ) / (2.0 * d_se * d_ew)
     if wp.abs(elbow_cos) > 1.0 + 1.0e-6:
-        success[tid] = 0
-        return
+        return geometry
     q4 = elbow_config * safe_acos(elbow_cos)
     horizontal = wp.length(wp.vec2(P26.x, P26.y))
-    ref_q1 = wp.atan2(P26.y, P26.x) if horizontal > 1.0e-10 else 0.0
+    ref_q1 = 0.0
+    if horizontal > 1.0e-10:
+        ref_q1 = wp.atan2(P26.y, P26.x)
     phi = safe_acos(
         (
             d_se * d_se
@@ -669,25 +552,46 @@ def compute_ik_kernel(
 
     usw = wp.normalize(P26)
     skew_usw = skew(usw)
+    geometry.As = skew_usw @ R03_o
+    geometry.Bs = -skew_usw @ skew_usw @ R03_o
+    geometry.Cs = wp.outer(usw, usw) @ R03_o
+    geometry.Aw = wp.transpose(R34) @ wp.transpose(geometry.As) @ R_target
+    geometry.Bw = wp.transpose(R34) @ wp.transpose(geometry.Bs) @ R_target
+    geometry.Cw = wp.transpose(R34) @ wp.transpose(geometry.Cs) @ R_target
+    geometry.q4 = q4
+    geometry.valid = 1
+    return geometry
+
+
+@wp.func
+def evaluate_ik_candidate(
+    geometry: IKGeometry,
+    target_xpos: wp.mat44,
+    angle_ref: float,
+    config: wp.vec3,
+    dh_params: wp.array(dtype=float),
+    rotation_directions: wp.array(dtype=float),
+    qpos_limits: wp.array(dtype=wp.vec2),
+    joint_seeds: wp.array(dtype=float),
+    nearest_weights: wp.array(dtype=float),
+    target_idx: int,
+    tid: int,
+    success: wp.array(dtype=int),
+    qpos_out: wp.array(dtype=float),
+):
+    if geometry.valid == 0:
+        success[tid] = 0
+        return
+    shoulder_config, wrist_config = config.x, config.z
+    q4 = geometry.q4
     s_psi = wp.sin(angle_ref)
     c_psi = wp.cos(angle_ref)
-
-    # Calculate shoulder joint angles (q1, q2, q3)
-    As = skew_usw @ R03_o
-    Bs = -skew_usw @ skew_usw @ R03_o
-    Cs = wp.outer(usw, usw) @ R03_o
-    R03 = As * s_psi + Bs * c_psi + Cs
-
+    R03 = geometry.As * s_psi + geometry.Bs * c_psi + geometry.Cs
     q1 = wp.atan2(R03[1, 1] * shoulder_config, R03[0, 1] * shoulder_config)
     q2 = wp.atan2(wp.length(wp.vec2(R03[0, 1], R03[1, 1])), R03[2, 1]) * shoulder_config
     q3 = wp.atan2(-R03[2, 2] * shoulder_config, -R03[2, 0] * shoulder_config)
 
-    # Calculate wrist joint angles (q5, q6, q7)
-    Aw = wp.transpose(R34) @ wp.transpose(As) @ R_target
-    Bw = wp.transpose(R34) @ wp.transpose(Bs) @ R_target
-    Cw = wp.transpose(R34) @ wp.transpose(Cs) @ R_target
-    R47 = Aw * s_psi + Bw * c_psi + Cw
-
+    R47 = geometry.Aw * s_psi + geometry.Bw * c_psi + geometry.Cw
     q5 = wp.atan2(R47[1, 2] * wrist_config, R47[0, 2] * wrist_config)
     q6 = wp.atan2(wp.length(wp.vec2(R47[0, 2], R47[1, 2])), R47[2, 2]) * wrist_config
     q7 = wp.atan2(R47[2, 1] * wrist_config, -R47[2, 0] * wrist_config)
@@ -864,150 +768,152 @@ def compute_ik_kernel(
         success[tid] = 0  # Mark as failed
 
 
-@wp.kernel
-def sort_ik_kernel(
-    qpos_out: wp.array(dtype=float),  # [N * N_SOL, 7]
-    success: wp.array(dtype=int),  # [N * N_SOL]
-    qpos_seed: wp.array(dtype=float),  # [N, 7]
-    ik_weight: wp.array(dtype=float),  # [7]
-    distances: wp.array(dtype=float),  # [N, N_SOL]
-    indices: wp.array(dtype=int),  # [N, N_SOL]
-    N_SOL: int,
-    sorted_qpos: wp.array(dtype=float),  # [N, N_SOL, 7]
-    sorted_valid: wp.array(dtype=int),  # [N, N_SOL]
+@_kernel
+def compute_ik_kernel(
+    target_xpos_list: wp.array(dtype=wp.mat44),
+    angles_list: wp.array(dtype=float),
+    qpos_limits: wp.array(dtype=wp.vec2),
+    configs: wp.array(dtype=wp.vec3),
+    dh_params: wp.array(dtype=float),
+    link_lengths: wp.array(dtype=float),
+    rotation_directions: wp.array(dtype=float),
+    joint_seeds: wp.array(dtype=float),
+    nearest_weights: wp.array(dtype=float),
+    success: wp.array(dtype=int),
+    qpos_out: wp.array(dtype=float),
 ):
-    """
-    Sort inverse kinematics (IK) solutions for multiple targets based on their distances
-    to a seed configuration.
-
-    Args:
-        qpos_out (wp.array): Array of computed joint positions for all solutions
-            ([N * N_SOL, 7]).
-        success (wp.array): Array indicating whether each solution is valid ([N * N_SOL]).
-        qpos_seed (wp.array): Array of seed joint positions for each target ([N, 7]).
-        ik_weight (wp.array): Array of weights for each joint to compute distance ([7]).
-        distances (wp.array): Output array to store computed distances ([N, N_SOL]).
-        indices (wp.array): Output array to store sorted indices ([N, N_SOL]).
-        N_SOL (int): Number of solutions per target.
-        sorted_qpos (wp.array): Output array for sorted joint positions ([N, N_SOL, 7]).
-        sorted_valid (wp.array): Output array for sorted validity flags ([N, N_SOL]).
-    """
-    tid = wp.tid()  # target index
-
-    # 1. compute distances
-    for i in range(N_SOL):
-        idx = tid * N_SOL + i
-        valid = success[idx]
-        dist = 0.0
-        if valid:
-            for j in range(7):
-                diff = qpos_out[idx * 7 + j] - qpos_seed[tid * 7 + j]
-                dist += ik_weight[j] * diff * diff
-        else:
-            dist = 1e10
-
-        distances[idx] = dist
-        indices[idx] = i
-
-    # 2. bubble sort (only sort the N_SOL solutions for the current target)
-    for i in range(N_SOL):
-        min_idx = i
-        for j in range(i + 1, N_SOL):
-            idx_a = tid * N_SOL + min_idx
-            idx_b = tid * N_SOL + j
-            if distances[idx_b] < distances[idx_a]:
-                min_idx = j
-        # Swap
-        if min_idx != i:
-            idx_i = tid * N_SOL + i
-            idx_min = tid * N_SOL + min_idx
-            tmp_dist = distances[idx_i]
-            distances[idx_i] = distances[idx_min]
-            distances[idx_min] = tmp_dist
-            tmp_idx = indices[idx_i]
-            indices[idx_i] = indices[idx_min]
-            indices[idx_min] = tmp_idx
-
-    # 3. reorder qpos_out and success according to sorted indices
-    for i in range(N_SOL):
-        src_idx = tid * N_SOL + indices[tid * N_SOL + i]
-        for j in range(7):
-            sorted_qpos[(tid * N_SOL + i) * 7 + j] = qpos_out[src_idx * 7 + j]
-        sorted_valid[tid * N_SOL + i] = success[src_idx]
+    """Compute IK directly from local target poses using the original kernel API."""
+    tid = wp.tid()
+    num_angles = angles_list.shape[0]
+    solutions_per_target = configs.shape[0] * num_angles
+    target_idx = tid // solutions_per_target
+    local_idx = tid - target_idx * solutions_per_target
+    config_idx = local_idx // num_angles
+    angle_idx = local_idx - config_idx * num_angles
+    config = configs[config_idx]
+    target = target_xpos_list[target_idx]
+    geometry = prepare_ik_geometry(target, config.y, dh_params, link_lengths)
+    evaluate_ik_candidate(
+        geometry,
+        target,
+        angles_list[angle_idx],
+        config,
+        dh_params,
+        rotation_directions,
+        qpos_limits,
+        joint_seeds,
+        nearest_weights,
+        target_idx,
+        tid,
+        success,
+        qpos_out,
+    )
 
 
-@wp.kernel
-def nearest_ik_kernel(
-    qpos_out: wp.array(dtype=float),  # [N * N_SOL * 7]
-    success: wp.array(dtype=int),  # [N * N_SOL]
-    qpos_seed: wp.array(dtype=float),  # [N * 7]
-    ik_weight: wp.array(dtype=float),  # [7]
-    N_SOL: int,
-    nearest_qpos: wp.array(dtype=float),  # [N * 7]
-    nearest_valid: wp.array(dtype=int),  # [N]
+@_kernel
+def prepare_ik_geometry_kernel(
+    target_xpos: wp.array(dtype=wp.mat44),
+    T_b_ob_inv: wp.mat44,
+    T_e_oe_inv: wp.mat44,
+    tcp_inv: wp.mat44,
+    dh_params: wp.array(dtype=float),
+    link_lengths: wp.array(dtype=float),
+    local_targets: wp.array(dtype=wp.mat44),
+    geometries: wp.array(dtype=IKGeometry),
 ):
-    """
-    Find the nearest valid inverse kinematics (IK) solution for each target.
-
-    Args:
-        qpos_out (wp.array): Array of computed joint positions for all solutions
-            ([N * N_SOL, 7]).
-        success (wp.array): Array indicating whether each solution is valid ([N * N_SOL]).
-        qpos_seed (wp.array): Array of seed joint positions for each target ([N, 7]).
-        ik_weight (wp.array): Array of weights for each joint to compute distance ([7]).
-        N_SOL (int): Number of solutions per target.
-        nearest_qpos (wp.array): Output array for the nearest joint positions ([N, 7]).
-        nearest_valid (wp.array): Output array indicating whether a valid solution was found ([N]).
-    """
-
-    tid = wp.tid()  # target index
-
-    min_dist = float(1e20)
-    nearest_idx = int(-1)
-
-    for i in range(N_SOL):
-        idx = tid * N_SOL + i
-        if success[idx]:
-            dist = 0.0
-            for j in range(7):
-                diff = qpos_out[idx * 7 + j] - qpos_seed[tid * 7 + j]
-                dist += ik_weight[j] * diff * diff
-            if dist < min_dist:
-                min_dist = dist
-                nearest_idx = idx
-
-    if nearest_idx >= 0:
-        for j in range(7):
-            nearest_qpos[tid * 7 + j] = qpos_out[nearest_idx * 7 + j]
-        nearest_valid[tid] = 1
-    else:
-        for j in range(7):
-            nearest_qpos[tid * 7 + j] = 0.0
-        nearest_valid[tid] = 0
+    """Transform targets and prepare only two elbow geometries per target."""
+    tid = wp.tid()
+    target_idx = tid // 2
+    elbow_idx = tid - target_idx * 2
+    elbow = -1.0
+    if elbow_idx == 0:
+        elbow = 1.0
+    local = transform_pose(target_xpos[target_idx], T_b_ob_inv, T_e_oe_inv, tcp_inv)
+    if elbow_idx == 0:
+        local_targets[target_idx] = local
+    geometries[tid] = prepare_ik_geometry(local, elbow, dh_params, link_lengths)
 
 
-@wp.kernel
-def check_success_kernel(
-    success_wp: wp.array(dtype=int),
-    num_solutions: int,
-    success_counts: wp.array(dtype=int),
+@_kernel
+def compute_prepared_ik_kernel(
+    target_xpos_list: wp.array(dtype=wp.mat44),
+    geometries: wp.array(dtype=IKGeometry),
+    angles_list: wp.array(dtype=float),
+    qpos_limits: wp.array(dtype=wp.vec2),
+    configs: wp.array(dtype=wp.vec3),
+    dh_params: wp.array(dtype=float),
+    rotation_directions: wp.array(dtype=float),
+    joint_seeds: wp.array(dtype=float),
+    nearest_weights: wp.array(dtype=float),
+    success: wp.array(dtype=int),
+    qpos_out: wp.array(dtype=float),
 ):
-    """
-    Count the number of successful inverse kinematics (IK) solutions for each target.
+    """Evaluate candidates using the target's shared elbow geometry."""
+    tid = wp.tid()
+    num_angles = angles_list.shape[0]
+    solutions_per_target = configs.shape[0] * num_angles
+    target_idx = tid // solutions_per_target
+    local_idx = tid - target_idx * solutions_per_target
+    config_idx = local_idx // num_angles
+    angle_idx = local_idx - config_idx * num_angles
+    config = configs[config_idx]
+    elbow_idx = 1
+    if config.y > 0.0:
+        elbow_idx = 0
+    geometry = geometries[target_idx * 2 + elbow_idx]
+    evaluate_ik_candidate(
+        geometry,
+        target_xpos_list[target_idx],
+        angles_list[angle_idx],
+        config,
+        dh_params,
+        rotation_directions,
+        qpos_limits,
+        joint_seeds,
+        nearest_weights,
+        target_idx,
+        tid,
+        success,
+        qpos_out,
+    )
 
-    Args:
-        success_wp (wp.array): Array indicating whether each solution is valid
-            ([N * num_solutions], where N is the number of targets).
-        num_solutions (int): Number of solutions per target.
-        success_counts (wp.array): Output array to store the count of valid solutions
-            for each target ([N]).
-    """
-    tid = wp.tid()  # target index
-    count = int(0)
 
-    for i in range(num_solutions):
-        idx = tid * num_solutions + i
-        if success_wp[idx]:
-            count += 1
-
-    success_counts[tid] = count
+@_kernel
+def ik_distance_kernel(
+    qpos_out: wp.array(dtype=float),
+    success: wp.array(dtype=int),
+    qpos_seed: wp.array(dtype=float),
+    weights: wp.array(dtype=float),
+    solutions_per_target: int,
+    distances: wp.array(dtype=float),
+):
+    """Score each candidate without materializing (N, solutions, 7) temporaries."""
+    candidate = wp.tid()
+    distance = wp.inf
+    if success[candidate] != 0:
+        target = candidate // solutions_per_target
+        squared_distance = 0.0
+        for joint in range(7):
+            delta = (
+                qpos_out[candidate * 7 + joint] - qpos_seed[target * 7 + joint]
+            ) * weights[joint]
+            squared_distance += delta * delta
+        distance = wp.sqrt(squared_distance)
+        if not wp.isfinite(distance):
+            # Finite seeds can exceed the float32 squared-norm range. Keep
+            # valid candidates ahead of invalid +inf rows, without adding
+            # float64 arithmetic to the normal control-loop path.
+            wide_squared_distance = wp.float64(0.0)
+            for joint in range(7):
+                wide_delta = (
+                    wp.float64(qpos_out[candidate * 7 + joint])
+                    - wp.float64(qpos_seed[target * 7 + joint])
+                ) * wp.float64(weights[joint])
+                wide_squared_distance += wide_delta * wide_delta
+            distance = float(
+                wp.min(
+                    wp.sqrt(wide_squared_distance),
+                    wp.float64(3.4028234663852886e38),
+                )
+            )
+    distances[candidate] = distance
