@@ -82,6 +82,11 @@ def _as_tensor(value, *args, **kwargs):
     return torch.as_tensor(value, *args, **kwargs)
 
 
+def _torch_view(array):
+    """Share Warp storage through DLPack with explicit array ownership."""
+    return torch.from_dlpack(wp.to_dlpack(array))
+
+
 def _validate_pose(pose, name="transform", tolerance=1e-6):
     pose = np.asarray(pose, dtype=float)
     if pose.shape != (4, 4) or not np.all(np.isfinite(pose)):
@@ -846,9 +851,11 @@ class _WarpSRSSolverImpl(_BaseSRSSolverImpl):
         self._refresh_weights()
         self._workspace_key = None
         self._workspace = {}
+        self._workspace_views = {}
         self._validation_error = wp.zeros(
             1, dtype=int, device=standardize_device_string(self.device)
         )
+        self._validation_status = _torch_view(self._validation_error)
 
     def _refresh_weights(self):
         """Refresh device constants after a live configuration weight edit."""
@@ -889,17 +896,21 @@ class _WarpSRSSolverImpl(_BaseSRSSolverImpl):
         if key == self._workspace_key:
             return self._workspace
         device = standardize_device_string(self.device)
-        self._workspace_key = key
         self._workspace = {
             "xpos": wp.empty(num_targets, dtype=wp.mat44, device=device),
             "geometry": wp.empty(num_targets * 2, dtype=IKGeometry, device=device),
             "qpos": wp.empty(num_combinations * 7, dtype=float, device=device),
             "success": wp.empty(num_combinations, dtype=int, device=device),
         }
+        self._workspace_views = {
+            name: _torch_view(self._workspace[name]) for name in ("qpos", "success")
+        }
+        self._workspace_key = key
         return self._workspace
 
-    def _solution_distances(self, qpos_out_wp, success_wp, seed, num_per_target):
+    def _solution_distances(self, seed, num_per_target):
         """Reuse one scalar score per candidate; Torch performs the stable reduction."""
+        success_wp = self._workspace["success"]
         distances = self._workspace.get("distances")
         if distances is None:
             distances = wp.empty(
@@ -908,11 +919,12 @@ class _WarpSRSSolverImpl(_BaseSRSSolverImpl):
                 device=standardize_device_string(self.device),
             )
             self._workspace["distances"] = distances
+            self._workspace_views["distances"] = _torch_view(distances)
         wp.launch(
             ik_distance_kernel,
             dim=success_wp.shape[0],
             inputs=[
-                qpos_out_wp,
+                self._workspace["qpos"],
                 success_wp,
                 wp.from_torch(seed.contiguous().flatten()),
                 self.distance_weights_wp,
@@ -921,15 +933,15 @@ class _WarpSRSSolverImpl(_BaseSRSSolverImpl):
             outputs=[distances],
             device=standardize_device_string(self.device),
         )
-        return wp.to_torch(distances).view(-1, num_per_target)
+        return self._workspace_views["distances"].view(-1, num_per_target)
 
-    def _select_solutions(self, qpos, flags, seed, count, candidates, return_all):
+    def _select_solutions(self, seed, count, candidates, return_all):
         """Rank valid candidates and return independent, zero-masked outputs."""
-        joints = wp.to_torch(qpos).view(count, candidates, 7)
-        valid = wp.to_torch(flags).view(count, candidates).bool()
+        joints = self._workspace_views["qpos"].view(count, candidates, 7)
+        valid = self._workspace_views["success"].view(count, candidates).bool()
         success = valid.any(dim=1)
         if self.cfg.sort_ik:
-            distances = self._solution_distances(qpos, flags, seed, candidates)
+            distances = self._solution_distances(seed, candidates)
             if return_all:
                 order = distances.argsort(dim=1, stable=True)
                 joints = torch.gather(joints, 1, order[:, :, None].expand(-1, -1, 7))
@@ -962,7 +974,7 @@ class _WarpSRSSolverImpl(_BaseSRSSolverImpl):
             outputs=[self._validation_error],
             device=standardize_device_string(self.device),
         )
-        code = int(wp.to_torch(self._validation_error)[0].item())
+        code = int(self._validation_status.item())
         if code == 3:
             raise ValueError("target_xpos must contain only finite values")
         if code == 2:
@@ -1012,8 +1024,6 @@ class _WarpSRSSolverImpl(_BaseSRSSolverImpl):
             device=device,
         )
         return self._select_solutions(
-            workspace["qpos"],
-            workspace["success"],
             qpos_seed,
             count,
             candidates,
@@ -1291,8 +1301,14 @@ class SRSSolver:
         with _torch_stream(self.device):
             warp_device = standardize_device_string(self.device)
             joint_angles = wp.from_torch(qpos_tensor.contiguous().flatten())
-            poses = wp.empty(qpos_tensor.shape[0], dtype=wp.mat44, device=warp_device)
-            success = wp.empty(qpos_tensor.shape[0], dtype=int, device=warp_device)
+            poses = torch.empty(
+                (qpos_tensor.shape[0], 4, 4),
+                dtype=qpos_tensor.dtype,
+                device=self.device,
+            )
+            success = torch.empty(
+                qpos_tensor.shape[0], dtype=torch.int32, device=self.device
+            )
             wp.launch(
                 compute_fk_kernel,
                 dim=qpos_tensor.shape[0],
@@ -1304,12 +1320,12 @@ class SRSSolver:
                     wp.mat44(*np.asarray(self.cfg.T_e_oe).flatten()),
                     wp.mat44(*np.asarray(self.cfg.tcp).flatten()),
                 ],
-                outputs=[poses, success],
+                outputs=[wp.from_torch(poses, dtype=wp.mat44), wp.from_torch(success)],
                 device=warp_device,
             )
-            if not bool(wp.to_torch(success).all()):
+            if not bool(success.all()):
                 raise ValueError("qpos must contain only finite values")
-            return wp.to_torch(poses).view(-1, 4, 4)
+            return poses
 
     def get_all_fk_mat(self, qpos: np.ndarray | torch.Tensor) -> torch.Tensor:
         """Return (N, 8, 4, 4): seven DH link frames followed by the TCP.
@@ -1331,10 +1347,8 @@ class SRSSolver:
             return torch.empty((0, 8, 4, 4), dtype=joints.dtype, device=self.device)
         if self.use_warp:
             with _torch_stream(self.device):
-                output = wp.empty(
-                    count * 8,
-                    dtype=wp.mat44,
-                    device=standardize_device_string(self.device),
+                output = torch.empty(
+                    (count, 8, 4, 4), dtype=joints.dtype, device=self.device
                 )
                 wp.launch(
                     compute_fk_chain_kernel,
@@ -1346,10 +1360,10 @@ class SRSSolver:
                         wp.mat44(*self.cfg.T_b_ob.ravel()),
                         wp.mat44(*(self.cfg.T_e_oe @ self.cfg.tcp).ravel()),
                     ],
-                    outputs=[output],
+                    outputs=[wp.from_torch(output.view(-1, 4, 4), dtype=wp.mat44)],
                     device=standardize_device_string(self.device),
                 )
-                return wp.to_torch(output).view(count, 8, 4, 4)
+                return output
         physical = joints.detach().cpu().numpy() * self.cfg.rotation_directions
         transforms = self.impl._joint_transforms(physical)
         pose = np.broadcast_to(self.cfg.T_b_ob, (count, 4, 4)).copy()
