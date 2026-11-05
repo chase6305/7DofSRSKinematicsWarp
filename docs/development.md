@@ -12,7 +12,7 @@ python tools/check_wheel.py dist/*.whl
 Sibling NumPy checkouts enable cross-repository tests automatically; otherwise
 set `SRS_NUMPY_REPO`. They compare FK, Jacobians, all eight branches and global
 solution selection. Warp tests run on CPU and additionally on CUDA when
-available. CI also checks the minimum Warp 1.5.0 / NumPy 1.24.4 combination.
+available. CI also checks Warp 1.5.0 with Torch 2.1.2 and NumPy 1.24.4.
 
 ## Solver design
 
@@ -76,8 +76,8 @@ NumPy-backend comparison recorded in [viewer data](benchmarks/viewer.json).
 That measures IK and server construction, excluding initial app construction,
 network, browser and WebGL; it is separate from CUDA solver throughput.
 
-For 4096 CPU fallback robots, complete FK calls changed from 1.636 to 1.210 ms
-and peak tracked allocations from 5.51 to 2.49 MB against `aff1574`.
+For 4096 CPU fallback robots, complete FK calls changed from 1.861 to 1.366 ms
+and peak tracked allocations from 5.51 to 2.26 MB against `aff1574`.
 [Batch-chain data](benchmarks/batch-chain.json) includes link poses, Jacobians,
 raw trials and allocation scope. These are single-thread CPU measurements,
 including input conversion and output storage, with equal outputs verified.
