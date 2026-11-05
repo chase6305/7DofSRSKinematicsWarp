@@ -25,6 +25,8 @@ class SingleArmViserViewer:
 
         self.urdf_path = urdf_path.resolve()
         self.server = viser.ViserServer(host=host, port=port)
+        self.port = self.server.get_port()
+        self.closed = False
 
         self.robot_model = yourdfpy.URDF.load(str(self.urdf_path))
         self.viser_robot = ViserUrdf(
@@ -63,6 +65,17 @@ class SingleArmViserViewer:
                 time.sleep(1.0)
         except KeyboardInterrupt:
             pass
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        if not self.closed:
+            try:
+                self.server.stop()
+            except RuntimeError as error:
+                if str(error) != "Event loop is closed":
+                    raise
+            self.closed = True
 
 
 def _parse_args() -> argparse.Namespace:

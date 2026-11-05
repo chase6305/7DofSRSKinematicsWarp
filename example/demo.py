@@ -185,6 +185,7 @@ def run_ab_pose_interp_ik_sim(host: str, port: int, steps: int, dt: float) -> No
         port=port,
     )
 
+    print(f"Viewer ready at http://{host}:{viewer.port}. Press Ctrl+C to exit.")
     try:
         while True:
             for q in trajectory_q:
@@ -195,9 +196,8 @@ def run_ab_pose_interp_ik_sim(host: str, port: int, steps: int, dt: float) -> No
                 time.sleep(dt)
     except KeyboardInterrupt:
         pass
-
-    print(f"Viewer ready at http://{host}:{port}. Press Ctrl+C to exit.")
-    viewer.serve_forever()
+    finally:
+        viewer.close()
 
 
 def parse_args() -> argparse.Namespace:
