@@ -135,3 +135,58 @@ def test_empty_invalid_and_unreachable_batches(use_warp, device):
         solver.solve_configurations(target, [], np.full(7, np.nan))
     with pytest.raises(ValueError):
         solver.solve_configurations(np.diag([2, 1, 1, 1]), [])
+
+
+@pytest.mark.parametrize("use_warp,device", BACKENDS)
+@pytest.mark.parametrize("dtype", [np.float16, np.float32, np.float64])
+def test_exact_arm_angle_precision_is_independent_of_scalar_storage(
+    use_warp, device, dtype
+):
+    solver = SRSSolver(SRSSolverCfg(), 1, device, use_warp=use_warp)
+    solver.set_position_limits(np.full(7, -4.0), np.full(7, 4.0))
+    q = np.array([0.3, -0.5, 0.7, 1.0, -0.4, 0.8, -0.2])
+    target = solver._geometry_impl._get_fk(q)
+    branch = solver.get_configuration(q)
+    for phase in (dtype(0.1), dtype(-2.7), dtype(65504)):
+        requested = SRSConfiguration(branch.shoulder, branch.elbow, branch.wrist, phase)
+        canonical = SRSConfiguration(
+            branch.shoulder, branch.elbow, branch.wrist, float(phase)
+        )
+        expected_ok, expected = solver.solve_configuration(target, canonical, q)
+        ok, actual = solver.solve_configuration(target, requested, q)
+        assert expected_ok and ok
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        mask, joints = solver.solve_configurations(target, [requested], q)
+        assert bool(mask[0])
+        torch.testing.assert_close(joints[0], expected, atol=0, rtol=0)
+        np.testing.assert_allclose(
+            solver._geometry_impl._get_fk(actual.cpu().numpy()),
+            target,
+            atol=2e-6,
+            rtol=0,
+        )
+
+
+@pytest.mark.parametrize("use_warp,device", BACKENDS)
+def test_request_cache_detects_replaced_records_and_invalid_list_entries(
+    use_warp, device
+):
+    solver = SRSSolver(SRSSolverCfg(), 1, device, use_warp=use_warp)
+    solver.set_position_limits(np.full(7, -4.0), np.full(7, 4.0))
+    q = np.array([0.3, -0.5, 0.7, 1.0, -0.4, 0.8, -0.2])
+    target = solver._geometry_impl._get_fk(q)
+    branch = solver.get_configuration(q)
+    requests = [
+        SRSConfiguration(branch.shoulder, branch.elbow, branch.wrist, np.float16(0.1))
+    ]
+    ok, first = solver.solve_configurations(target, requests, q)
+    assert bool(ok[0])
+    requests[0] = SRSConfiguration(branch.shoulder, branch.elbow, branch.wrist, 0.1)
+    ok, second = solver.solve_configurations(target, requests, q)
+    assert bool(ok[0]) and float(torch.linalg.vector_norm(first - second)) > 1e-6
+    expected_ok, expected = solver.solve_configuration(target, requests[0], q)
+    assert expected_ok
+    torch.testing.assert_close(second[0], expected, atol=0, rtol=0)
+    requests[0] = np.zeros(7)
+    with pytest.raises(TypeError, match="SRSConfiguration"):
+        solver.solve_configurations(target, requests, q)

@@ -544,7 +544,7 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
             rconf = np.asarray(rconf)
             arm_config = np.where(rconf & 1, -1, 1)
             wrist_config = np.where(rconf & 4, -1, 1)
-        psi = np.asarray(nsparams)
+        psi = np.asarray(nsparams, dtype=float)
         sine, cosine = np.sin(psi)[..., None, None], np.cos(psi)[..., None, None]
         r03 = shoulder[0] * sine + shoulder[1] * cosine + shoulder[2]
         r47 = wrist[0] * sine + wrist[1] * cosine + wrist[2]
@@ -1422,23 +1422,14 @@ class SRSSolver:
         )
         if seed.shape != (7,) or not np.all(np.isfinite(seed)):
             raise ValueError("joint_seed must be a finite array of shape (7,)")
-        configurations = tuple(configurations)
-        if any(not isinstance(c, SRSConfiguration) for c in configurations):
-            raise TypeError("configurations must contain SRSConfiguration values")
+        configurations, branches, angles = self._prepare_configuration_requests(
+            configurations
+        )
         self._geometry_impl._refresh_weights()
         if not configurations:
             output = np.zeros((0, 7))
             success = np.zeros(0, dtype=bool)
         else:
-            branches = np.array(
-                [
-                    int(c.shoulder < 0)
-                    | (int(c.elbow < 0) << 1)
-                    | (int(c.wrist < 0) << 2)
-                    for c in configurations
-                ]
-            )
-            angles = np.array([c.redundancy for c in configurations])
             impl = self._geometry_impl
             local = impl._local_target(target)
             success, output = impl._configuration_candidates(
@@ -1454,6 +1445,40 @@ class SRSSolver:
             _as_tensor(success, device=self.device),
             _as_tensor(output, dtype=torch.float32, device=self.device),
         )
+
+    def _prepare_configuration_requests(self, configurations):
+        """Reuse one batch of unchanged frozen configuration objects."""
+        configurations = tuple(configurations)
+        cached = getattr(self, "_configuration_request_cache", None)
+        if cached is not None and (
+            configurations is cached[0]
+            or len(configurations) == len(cached[0])
+            and all(
+                current is previous
+                for current, previous in zip(configurations, cached[0])
+            )
+        ):
+            return cached
+        if any(not isinstance(c, SRSConfiguration) for c in configurations):
+            raise TypeError("configurations must contain SRSConfiguration values")
+        branches = np.fromiter(
+            (
+                (c.shoulder < 0) | ((c.elbow < 0) << 1) | ((c.wrist < 0) << 2)
+                for c in configurations
+            ),
+            dtype=int,
+            count=len(configurations),
+        )
+        angles = np.fromiter(
+            (c.redundancy for c in configurations),
+            dtype=float,
+            count=len(configurations),
+        )
+        branches.setflags(write=False)
+        angles.setflags(write=False)
+        cached = configurations, branches, angles
+        self._configuration_request_cache = cached
+        return cached
 
     def update_with_robot_limit(self, robot_qpos_limits):
         limits = np.asarray(robot_qpos_limits, dtype=np.float32)

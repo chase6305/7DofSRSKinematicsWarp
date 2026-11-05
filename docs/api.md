@@ -52,6 +52,10 @@ Batch conventions:
   boolean `(N,)` success and float32 `(N, 7)` joints in input order. Invalid
   rows are zero and must be masked. Geometry is shared by elbow branch and
   arm-angle decomposition and FK verification are batched.
+- Repeated batches reuse metadata from unchanged frozen configuration records.
+  The viewer also reuses compiled requests for an unchanged branch grid; targets,
+  seeds, limits, weights and final FK checks remain live. CPU geometry evaluates
+  exact arm angles in float64, including NumPy float16/float32 scalar inputs.
 - Exact configuration queries and CPU IK reuse the most recent target geometry;
   seeds, limits and weights remain live on every call.
 - `set_tcp()`/`get_tcp()` update the flange-to-tool transform consistently for
