@@ -1509,9 +1509,9 @@ class SRSSolver:
         target_xpos = target_xpos.contiguous()
         if target_xpos.shape[0] == 0:
             slots = 8 * self.cfg.num_samples if return_all_solutions else 1
-            return torch.empty(0, dtype=torch.bool, device=self.device), torch.empty(
-                (0, slots, 7), device=self.device
-            )
+            return torch.empty(
+                0, dtype=torch.bool, device=self.device
+            ), target_xpos.new_empty((0, slots, 7))
         with _torch_stream(self.device):
             if self.use_warp:
                 self.impl._validate_inputs(target_xpos, qpos_seed)
@@ -1538,7 +1538,7 @@ class SRSSolver:
                     )
                     or not torch.allclose(
                         torch.linalg.det(rotation),
-                        torch.ones(target_xpos.shape[0], device=self.device),
+                        target_xpos.new_ones(target_xpos.shape[0]),
                         atol=1e-6,
                         rtol=0,
                     )

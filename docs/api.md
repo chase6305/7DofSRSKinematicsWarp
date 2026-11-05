@@ -4,7 +4,6 @@
 
 ```python
 import torch
-import numpy as np
 from srs_solver import SRSSolver, SRSSolverCfg
 
 cfg = SRSSolverCfg()
@@ -20,6 +19,8 @@ print(success, qpos)
 
 Batch conventions:
 
+- Tensor results use float32 on the solver device; success flags use bool.
+  The application's Torch default dtype does not change these types.
 - `get_fk(qpos)` accepts `(7,)` or `(N, 7)` and returns `(N, 4, 4)`.
 - `get_all_fk_mat(qpos)` accepts the same inputs and returns `(N, 8, 4, 4)`:
   seven world-frame DH link poses followed by the TCP, computed in one chain
@@ -28,8 +29,11 @@ Batch conventions:
   `(7,)`/`(N, 7)` seed. It returns success `(N,)` and solutions `(N, 1, 7)`.
 - With `return_all_solutions=True`, the solution dimension is
   `8 * cfg.num_samples`; invalid slots are zero and valid solutions are first
-  when sorting is enabled.
-- `get_jacobian()` returns analytical world-frame Jacobians from one joint-chain traversal, including base/tool transforms and joint rotation directions.
+  when sorting is enabled. Success remains per target; no separate
+  candidate-validity mask is returned.
+- `get_jacobian(q)` returns `(6, 7)` for `(7,)` input or `(N, 6, 7)` for a
+  batch, in world coordinates with linear velocity first. Base/tool transforms
+  and joint rotation directions are included.
 - `get_null_space_direction()` returns one deterministic unit null direction.
   `get_null_space_velocity()` projects into the full Jacobian null space through
   orthonormal SVD vectors, retaining extra directions at singular poses. Its rank
@@ -42,7 +46,8 @@ Batch conventions:
   boolean `(N,)` success and float32 `(N, 7)` joints in input order. Invalid
   rows are zero and must be masked. Geometry is shared by elbow branch and
   arm-angle decomposition and FK verification are batched.
-- Scalar configurations, configuration batches and CPU IK search reuse the most recent local target's geometry, retaining at most two elbow branches. Cache keys use the exact target, DH parameters and link lengths. Seeds, current limits, weights and feasibility checks are evaluated on every call. Fixed-TCP self-motion benefits; moving targets rebuild geometry with a small cache-check overhead. This cache applies to CPU geometry, including exact configuration queries on a CUDA solver; global Warp kernels retain their existing execution path.
+- Exact configuration queries and CPU IK reuse the most recent target geometry;
+  seeds, limits and weights remain live on every call.
 - `set_tcp()`/`get_tcp()` update the flange-to-tool transform consistently for
   FK, CPU IK and Warp IK.
 
@@ -58,12 +63,6 @@ iiwa 7 R800 geometry, URDF path and joint limits directly.
 - Empty batches return empty outputs of the documented shapes. Importing the library does not configure application logging.
 - Reversed NumPy slices such as `q[::-1]` and `q[:, ::-1]` are accepted. Views with negative strides are copied before tensor conversion, including joint states, IK targets/seeds and TCP transforms.
 - Wheels include the URDF and all visual/collision meshes; the solver, viewer and demo resolve installed resources outside the source checkout.
-
-Mixed shoulder/wrist requests in `solve_configurations` are decomposed together
-in at most two elbow groups. Output order, per-row validity, periodic mapping,
-seed-weighted singular solutions and live joint limits are preserved. This is
-a CPU geometry optimization in both repositories, including exact queries on
-a CUDA-configured Warp solver; CUDA global search uses a separate candidate kernel.
 
 Joint-distance weights are normalized before ranking: multiplying all weights
 by the same positive finite factor does not change the selected solution.

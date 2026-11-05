@@ -39,7 +39,7 @@ and collision geometry in the NumPy model remain unchanged.
 
 ## Regenerate
 
-Run from the repository root with the visualization extra installed:
+Run from the repository root with the `viewer` extra installed:
 
 ```bash
 python tools/build_iiwa7_assets.py
