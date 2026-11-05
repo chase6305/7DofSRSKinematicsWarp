@@ -875,7 +875,7 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
         seeds = (
             np.zeros((count, 7))
             if qpos_seed is None
-            else qpos_seed.detach().cpu().numpy()
+            else np.asarray(qpos_seed.detach().cpu().numpy(), dtype=np.float64)
         )
         targets = target_xpos.detach().cpu().numpy()
         slots = 8 * self.cfg.num_samples if return_all_solutions else 1

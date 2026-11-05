@@ -122,3 +122,14 @@ def test_replacing_weights_also_updates_exact_singular_queries(
     cfg.ik_nearest_weight[0] = -1
     with pytest.raises(ValueError, match="non-negative"):
         query()
+
+
+def test_cpu_mapping_and_ranking_keep_float64_range():
+    solver = SRSSolver(SRSSolverCfg(num_samples=17), 1, "cpu", use_warp=False)
+    target = solver.get_fk(np.array([0.3, -0.5, 0.7, 1.0, -0.4, 0.8, -0.2]))
+    limits = np.full(7, 3e38)
+    solver.set_position_limits(limits, limits)
+    with np.errstate(all="raise"):
+        ok, joints = solver.get_ik(target, -limits, search_mode="global")
+    assert not bool(ok.any())
+    assert not bool(joints.any())
