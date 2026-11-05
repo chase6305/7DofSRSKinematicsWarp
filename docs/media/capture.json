@@ -30,7 +30,9 @@
       "observed_offset_deg": [
         -89.98026151273613,
         89.98026151273609
-      ]
+      ],
+      "gif_frames": 149,
+      "gif_duration_ms": 10000
     },
     {
       "mode": "trajectory",
@@ -49,15 +51,18 @@
       "path": "figure-eight",
       "plane": "world-xy",
       "path_size_m": 0.09,
-      "accepted_steps": 300
+      "accepted_steps": 300,
+      "gif_frames": 150,
+      "gif_duration_ms": 10000
     }
   ],
   "dependencies": {
     "numpy": "2.2.6",
+    "torch": "2.13.0",
+    "warp-lang": "1.16.0",
     "viser": "1.0.24",
     "yourdfpy": "0.0.60",
-    "trimesh": "4.12.2",
-    "torch": "2.13.0+cu130",
-    "warp": "1.16.0"
-  }
+    "trimesh": "4.12.2"
+  },
+  "viewer_sha256": "6943963b1c70c1ab2a741603d99a41bed328faee7e42305853c83d670a7f9775"
 }

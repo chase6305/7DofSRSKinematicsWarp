@@ -29,6 +29,13 @@ miss feasible intervals. The exact branch/arm-angle API uses CPU geometry even
 when the selected device is CUDA; see [API contracts](api.md) for shapes and
 scalar conventions.
 
+Explicit `interval` search uses float64 CPU geometry to check analytical
+joint-limit boundaries and cell midpoints. It preserves CPU input precision
+and avoids native kernel launches; only the result moves to the selected
+device. Boundary events reuse up to two geometry/limit-specific arrays, while
+seeds, weights and FK residual checks remain live. NumPy continuous mode uses
+this search only after its local and uniform queries fail.
+
 FK checks finite inputs in its existing launch. Its seven-joint chain retains
 intermediates for Warp Tape gradients. Null-space velocity uses a full SVD to
 preserve extra null directions at singular poses. Modern Warp versions compile
@@ -37,6 +44,14 @@ kernels separately; Warp 1.5 retains the compatible module registration path.
 The NumPy CPU fallback reuses one DH matrix buffer for batches of at least 256
 robots and preallocates link poses and Jacobian storage; small batches retain
 eager DH evaluation.
+
+Repeated 584-request manifold batches now reuse frozen configurations and
+branch/angle metadata. Complete warmed calls changed from 1.398 to 0.591 ms
+(about 58% lower latency) against the preceding implementation. The comparison
+uses CPU affinity 30, one BLAS/OpenMP thread and ABBA process order, with 30
+raw trials per revision. [Request-reuse data](benchmarks/request-reuse.json)
+includes the commands, revisions and all measured workloads. These are CPU
+exact-query timings, including request construction and output conversion.
 
 ## Reproduce benchmarks
 
@@ -59,7 +74,7 @@ Recorded local comparisons on RTX 5090 D v2, Python 3.10, Torch 2.13.0+cu130,
 Warp 1.16.0 and NumPy 2.2.6:
 
 | Workload | Baseline | Optimized |
-|:--|--:|--:|
+| :-- | --: | --: |
 | Global IK, 64 CUDA targets | 0.594 ms | 0.245 ms |
 | Global IK, 4096 CUDA targets | 0.962 ms | 0.480 ms |
 | Constructor + first FK, CUDA | 20.371 s | 2.231 s |
@@ -81,6 +96,13 @@ and peak tracked allocations from 5.51 to 2.26 MB against `aff1574`.
 [Batch-chain data](benchmarks/batch-chain.json) includes link poses, Jacobians,
 raw trials and allocation scope. These are single-thread CPU measurements,
 including input conversion and output storage, with equal outputs verified.
+
+The same interval-cache comparison uses CPU geometry through the Warp API:
+120 repeated queries, 15 trials and one CPU thread reduced median per-query
+latency from 0.726 to 0.560 ms. Cached and uncached outputs were identical.
+[Interval-query data](benchmarks/interval-query.json) records all trials, residuals
+and the command. This measures the CPU query path, separately from native
+Warp batch throughput.
 
 See [asset provenance](assets.md) for the R800 model. Analytical references:
 [Shimizu et al., 2008](https://doi.org/10.1109/TRO.2008.2003266) and

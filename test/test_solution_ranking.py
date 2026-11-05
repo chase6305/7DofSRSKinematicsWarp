@@ -56,7 +56,8 @@ def test_weighted_nearest_all_order_and_failed_rows(use_warp, device, weights):
 
 
 @pytest.mark.parametrize("use_warp,device", BACKENDS)
-def test_weight_edits_refresh_cached_scores(use_warp, device):
+@pytest.mark.parametrize("replace", [False, True])
+def test_weight_edits_refresh_cached_scores(use_warp, device, replace):
     cfg = SRSSolverCfg(num_samples=32, sort_ik=False)
     solver = SRSSolver(cfg, 1, device, use_warp=use_warp)
     q = torch.tensor([0.3, -0.5, 0.7, 1.0, -0.4, 0.8, -0.2], device=device)
@@ -70,7 +71,10 @@ def test_weight_edits_refresh_cached_scores(use_warp, device):
         target, seed, search_mode="global"
     )  # Populate the reusable score buffer.
     weights = np.array([100.0, 1, 0, 1, 1, 0, 1])
-    cfg.ik_nearest_weight[:] = weights * 1e-200
+    if replace:
+        cfg.ik_nearest_weight = (weights * 1e-200).tolist()
+    else:
+        cfg.ik_nearest_weight[:] = weights * 1e-200
     cost = torch.linalg.vector_norm(
         (candidates - seed[None, None])
         * torch.tensor(weights, dtype=torch.float32, device=device),
@@ -81,3 +85,51 @@ def test_weight_edits_refresh_cached_scores(use_warp, device):
     ok, nearest = solver.get_ik(target, seed, search_mode="global")
     assert bool(ok.all())
     torch.testing.assert_close(nearest, expected, atol=1e-6, rtol=0)
+
+
+@pytest.mark.parametrize("use_warp,device", BACKENDS)
+@pytest.mark.parametrize("batched", [False, True])
+def test_replacing_weights_also_updates_exact_singular_queries(
+    use_warp, device, batched
+):
+    cfg = SRSSolverCfg()
+    solver = SRSSolver(cfg, 1, device, use_warp=use_warp)
+    q = np.array([0.8, 0, 0.8, 1.0, -0.4, 0.8, -0.2])
+    lower, upper = np.full(7, -4.0), np.full(7, 4.0)
+    lower[[0, 2]], upper[[0, 2]] = 0, 1
+    solver.set_position_limits(lower, upper)
+    target = solver._geometry_impl._get_fk(q)
+    config = solver.get_configuration(q)
+    seed = q.copy()
+    seed[[0, 2]] = 0
+
+    def query():
+        if batched:
+            ok, joints = solver.solve_configurations(target, [config], seed)
+            assert bool(ok.all())
+            return joints[0]
+        ok, joints = solver.solve_configuration(target, config, seed)
+        assert ok
+        return joints
+
+    torch.testing.assert_close(
+        query()[[0, 2]].cpu(), torch.tensor([0.8, 0.8]), atol=1e-6, rtol=0
+    )
+    cfg.ik_nearest_weight = [1, 1, 3, 1, 1, 1, 1]
+    torch.testing.assert_close(
+        query()[[0, 2]].cpu(), torch.tensor([1.0, 0.6]), atol=1e-6, rtol=0
+    )
+    cfg.ik_nearest_weight[0] = -1
+    with pytest.raises(ValueError, match="non-negative"):
+        query()
+
+
+def test_cpu_mapping_and_ranking_keep_float64_range():
+    solver = SRSSolver(SRSSolverCfg(num_samples=17), 1, "cpu", use_warp=False)
+    target = solver.get_fk(np.array([0.3, -0.5, 0.7, 1.0, -0.4, 0.8, -0.2]))
+    limits = np.full(7, 3e38)
+    solver.set_position_limits(limits, limits)
+    with np.errstate(all="raise"):
+        ok, joints = solver.get_ik(target, -limits, search_mode="global")
+    assert not bool(ok.any())
+    assert not bool(joints.any())

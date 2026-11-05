@@ -1,46 +1,40 @@
 # 7DofSRSKinematicsWarp
 
-中文 | [English](README_EN.md) · [NumPy 参考实现](https://github.com/chase6305/7DofSRSKinematics)
+English | [简体中文](README_ZH.md) · [NumPy version](https://github.com/chase6305/7DofSRSKinematics)
 
-基于 NVIDIA Warp 的 7 自由度 S-R-S 解析运动学，提供 Torch 批量接口与 CPU 回退。
+Analytical kinematics for 7-DoF S-R-S arms, with GPU batching through NVIDIA
+Warp and PyTorch. Includes a KUKA iiwa 7 R800 example.
 
-**Demo 1 · 固定 TCP 自运动，臂角 ±90°**
+- Analytical FK / IK, eight S/E/W branches and arm-angle control.
+- Batched link poses, Jacobians and null-space motion.
+- Interactive demos and CSV export.
 
-![末端固定、肘部大幅度自运动](docs/media/self-motion.gif)
+## Demos
 
-**Demo 2 · 8 字轨迹跟踪，180 × 90 mm**
+### Fixed-TCP self-motion · ±90° arm-angle sweep
 
-![8 字参考路径与实际末端轨迹](docs/media/trajectory.gif)
+![Fixed TCP with a large elbow sweep](docs/media/self-motion.gif)
 
-两段独立的 Warp/CPU 实录，每段 10 秒。
+### Figure-eight TCP tracking · 180 × 90 mm
 
-- GPU 批量 FK / IK、解析雅可比和八种肩肘腕分支。
-- 与 NumPy 参考实现交叉校验，内置一致的 KUKA iiwa 7 R800 模型。
-- 五种交互实验、PBR 机器人资产与 CSV 运动导出。
+![Figure-eight reference and actual TCP trace](docs/media/trajectory.gif)
 
-## 运行演示
+Two ten-second recordings of the running viewer.
 
-Python 3.10+：
+## Quick start
+
+Python 3.10+:
 
 ```bash
 python -m pip install -e '.[viewer]'
-srs-warp-lab --backend warp --device cpu --demo arm-angle --amplitude 90 --frequency 0.1 --joint-speed 2 --autoplay
+srs-warp-lab --demo arm-angle --amplitude 90 --joint-speed 2 --autoplay
+# Or run the figure-eight demo:
+srs-warp-lab --demo trajectory --path-size 0.09 --autoplay
 ```
 
-打开 **http://127.0.0.1:8081**，通过 Experiment 切换实验。
-可用 `--device cuda` 运行 FK / 雅可比；实验室的精确构型 IK 在 CPU 上计算。
-
-| 实验 | 看点 |
-|:--|:--|
-| Arm angle | TCP 固定，肘部沿圆周自运动 |
-| Eight branches | 八种 S/E/W 构型的机器人模型并列展示 |
-| Jacobian | 速度椭球与固定 TCP 的关节居中 |
-| TCP trajectory | 直线、圆、8 字路径与实际轨迹对照 |
-| Self-motion manifold | 固定 TCP 的关节空间分支曲线 |
-
-第二个 demo：`srs-warp-lab --backend warp --device cpu --demo trajectory --path-size 0.09 --frequency 0.1 --autoplay`。
-
-[截图、控制方式与 CSV 导出 →](docs/demos.md)
+Open <http://127.0.0.1:8081>. Select an experiment and toggle **Play**.
+The sidebar also offers eight branches, a Jacobian ellipsoid and the self-motion
+manifold. [Controls and CSV export](docs/demos.md).
 
 ## Python API
 
@@ -48,25 +42,42 @@ srs-warp-lab --backend warp --device cpu --demo arm-angle --amplitude 90 --frequ
 import torch
 from srs_solver import KUKAiiwaSolver
 
-solver = KUKAiiwaSolver(device="cpu")
+solver = KUKAiiwaSolver(device="cpu")  # use "cuda" for GPU batches
 q = torch.tensor([[0.3, -0.5, 0.7, 1.0, -0.4, 0.8, -0.2]])
 target = solver.get_fk(q)
 ok, joints = solver.get_ik(target, torch.zeros_like(q))
-print(joints[ok, 0])  # valid rows, shape (N_valid, 7), radians
+print(joints[ok, 0])  # successful rows, radians
 ```
 
-`ok` 为 `(N,)`，最近解为 `(N, 1, 7)`，使用前先检查成功标志。
-[完整批量接口与数值约定 →](docs/api.md)
+[API reference](docs/api.md) covers batch shapes, frames and limits.
 
-## 验证与 GPU 基准
+## Benchmark
+
+Global IK on an RTX 5090 D v2 with Warp 1.16 and 73 arm-angle samples:
+
+| Batch size | Median latency |
+| ---: | ---: |
+| 64 | 0.245 ms |
+| 4096 | 0.480 ms |
+
+Warmed complete calls, including validation and selection; compilation excluded.
+[Raw results](docs/benchmarks/global-ik.json).
 
 ```bash
-python -m pip install -e '.[dev]'
-python -m pytest -q
-srs-warp-lab --validate-only --backend warp --device cpu
-srs-parallel-demo --device cuda --batch-size 4096 --num-samples 73 --repeats 20
+srs-parallel-demo --device cuda --batch-size 4096 --num-samples 73
 ```
 
-- [交互实验与录制](docs/demos.md) · [API](docs/api.md)
-- [测试、基准与 NumPy 对照](docs/development.md)
-- [R800 资产、PBR 材质与 iiwa14 参考分析](docs/assets.md) · [资产许可证](urdf/ASSET_LICENSE)
+## References
+
+- Shimizu et al. (2008). [Analytical Inverse Kinematic Computation for 7-DOF
+  Redundant Manipulators With Joint Limits and Its Application to Redundancy
+  Resolution](https://doi.org/10.1109/TRO.2008.2003266).
+  *IEEE Transactions on Robotics*, 24(5), 1131–1142.
+- Faria et al. (2018). [Position-based kinematics for 7-DoF serial manipulators
+  with global configuration control, joint limit and singularity
+  avoidance](https://doi.org/10.1016/j.mechmachtheory.2017.10.025).
+  *Mechanism and Machine Theory*, 121, 317–334.
+
+The arm-angle core supports sampled and joint-boundary search. The papers’
+redundancy/avoidance policies and experiments are not fully reproduced.
+See [implementation differences](docs/paper-comparison.md).

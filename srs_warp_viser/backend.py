@@ -45,9 +45,17 @@ class Backend:
         )
 
     def solve_many(self, target, configurations, seed):
+        requests = tuple((tuple(branch), float(psi)) for branch, psi in configurations)
+        cacheable = all(type(sign) is int for branch, _ in requests for sign in branch)
+        cached = getattr(self, "_configuration_cache", None)
+        if cacheable and cached is not None and requests == cached[0]:
+            compiled = cached[1]
+        else:
+            compiled = tuple(SRSConfiguration(*branch, psi) for branch, psi in requests)
+            self._configuration_cache = (requests, compiled) if cacheable else None
         success, joints = self.solver.solve_configurations(
             target,
-            [SRSConfiguration(*branch, float(psi)) for branch, psi in configurations],
+            compiled,
             seed,
         )
         return success.cpu().numpy(), joints.cpu().numpy().astype(float)

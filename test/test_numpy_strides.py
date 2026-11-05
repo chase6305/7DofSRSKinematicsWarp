@@ -26,11 +26,12 @@ def test_reversed_numpy_joint_target_seed_and_transform_views(use_warp, device, 
         torch.testing.assert_close(method(q), method(q.copy()), atol=0, rtol=0)
     targets = solver.get_fk(q.copy()).cpu().numpy()[::-1]
     seeds = (q.copy() + 0.02)[::-1]
-    expected = solver.get_ik(targets.copy(), seeds.copy(), search_mode="global")
-    actual = solver.get_ik(targets, seeds, search_mode="global")
-    assert bool(actual[0].all())
-    for value, reference in zip(actual, expected):
-        torch.testing.assert_close(value, reference, atol=0, rtol=0)
+    for mode in ("global", "interval"):
+        expected = solver.get_ik(targets.copy(), seeds.copy(), search_mode=mode)
+        actual = solver.get_ik(targets, seeds, search_mode=mode)
+        assert bool(actual[0].all())
+        for value, reference in zip(actual, expected):
+            torch.testing.assert_close(value, reference, atol=0, rtol=0)
 
     single = q.copy()[0, ::-1]
     configuration = solver.get_configuration(single)
