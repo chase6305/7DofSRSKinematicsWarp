@@ -255,7 +255,6 @@ class _BaseSRSSolverImpl:
 
     def __init__(self, cfg: SRSSolverCfg, device: torch.device):
         self.cfg = cfg
-        self.cfg.validate()
         self.device = device
         self.dofs = 7
         self.dh_params = np.asarray(cfg.dh_params)
@@ -282,6 +281,18 @@ class _BaseSRSSolverImpl:
         # and underflow for otherwise valid finite user weights.
         scale = np.max(self.ik_nearst_weight)
         return self.ik_nearst_weight / scale if scale > 0 else self.ik_nearst_weight
+
+    def _refresh_weights(self):
+        weights = np.asarray(self.cfg.ik_nearest_weight, dtype=float)
+        if (
+            weights.shape != (7,)
+            or not np.all(np.isfinite(weights))
+            or np.any(weights < 0)
+        ):
+            raise ValueError(
+                "ik_nearest_weight must be seven finite non-negative values"
+            )
+        self.ik_nearst_weight = weights
 
 
 class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
@@ -740,6 +751,117 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
             success[rows] = valid
         return success, output
 
+    def _joint_limit_arm_angles(self, prepared):
+        """Boundary events and open-cell midpoints for one elbow geometry.
+
+        Each decomposed joint meets a limit where a*sin(psi)+b*cos(psi)+c
+        vanishes. Both rays of atan2 are retained: extra cuts are harmless and
+        keep the event set independent of the shoulder and wrist branch signs.
+        Singular events are checked separately from their neighboring cells.
+        """
+        shoulder, wrist, _ = prepared
+        physical = self.qpos_limits_np * self.rotation_directions_np[:, None]
+        lower = physical.min(axis=1) + self.dh_params[:, 3]
+        upper = physical.max(axis=1) + self.dh_params[:, 3]
+        key = (lower.tobytes(), upper.tobytes())
+        cached = getattr(self, "_ik_boundary_cache", None)
+        entries = [] if cached is None or cached[0] != key else cached[1]
+        for geometry, angles in entries:
+            if geometry is prepared:
+                return angles
+        shoulder, wrist = np.asarray(shoulder), np.asarray(wrist)
+        equations = []
+        for joint, y, x in (
+            (0, shoulder[:, 1, 1], shoulder[:, 0, 1]),
+            (2, -shoulder[:, 2, 2], -shoulder[:, 2, 0]),
+            (4, wrist[:, 1, 2], wrist[:, 0, 2]),
+            (6, wrist[:, 2, 1], -wrist[:, 2, 0]),
+        ):
+            if upper[joint] - lower[joint] < 2 * np.pi:
+                for limit in (lower[joint], upper[joint]):
+                    equations.append(y * np.cos(limit) - x * np.sin(limit))
+        for first, middle, last, rotation, z in (
+            (0, 1, 2, shoulder, shoulder[:, 2, 1]),
+            (4, 5, 6, wrist, wrist[:, 2, 2]),
+        ):
+            values = [-1.0, 1.0]
+            if upper[middle] - lower[middle] < 2 * np.pi:
+                values.extend(np.cos([lower[middle], upper[middle]]))
+            for value in values:
+                equation = z.copy()
+                equation[2] -= value
+                equations.append(equation)
+            # A sphere can stay singular over the whole circle, e.g. at full
+            # extension. Its coupled outer-joint sum then determines feasibility.
+            if np.hypot(*z[:2]) < 1e-13 and abs(abs(z[2]) - 1) < 1e-13:
+                angle = np.arccos(np.clip(z[2], -1.0, 1.0))
+                d, alpha, a, _ = self.dh_params[first]
+                r1 = self._dh_transform(d, alpha, a, 0.0)[:3, :3]
+                d, alpha, a, _ = self.dh_params[middle]
+                r2 = self._dh_transform(d, alpha, a, angle)[:3, :3]
+                residual = (r1 @ r2).T @ rotation
+                sign = 1.0 if z[2] >= 0 else -1.0
+                limits = (
+                    lower[first] + min(sign * lower[last], sign * upper[last]),
+                    upper[first] + max(sign * lower[last], sign * upper[last]),
+                )
+                for limit in limits:
+                    equations.append(
+                        residual[:, 1, 0] * np.cos(sign * limit)
+                        - residual[:, 0, 0] * np.sin(sign * limit)
+                    )
+        roots = self._harmonic_arm_angle_roots(equations)
+        cuts = np.unique(np.r_[-np.pi, roots, np.pi])
+        angles = np.unique(np.r_[cuts, cuts[:-1] + np.diff(cuts) / 2])
+        angles.setflags(write=False)
+        self._ik_boundary_cache = (key, (entries + [(prepared, angles)])[-2:])
+        return angles
+
+    @staticmethod
+    def _harmonic_arm_angle_roots(equations):
+        """Solve harmonic zeros via a stable tan(psi/2) quadratic.
+
+        Computing phase +/- acos instead can lose the small arm-angle root to
+        cancellation, which matters when an outer joint has a fixed limit.
+        """
+        a, b, c = np.asarray(equations).T
+        amplitude = np.hypot(a, b)
+        valid = (amplitude > 0) & (np.abs(c) <= amplitude * (1 + 1e-12))
+        a, b, c, amplitude = (v[valid] for v in (a, b, c, amplitude))
+        discriminant = np.maximum((amplitude - np.abs(c)) * (amplitude + np.abs(c)), 0)
+        q = -a - np.copysign(np.sqrt(discriminant), a)
+        first = np.divide(q, c - b, out=np.full_like(q, np.inf), where=c != b)
+        second = np.divide(b + c, q, out=first.copy(), where=q != 0)
+        return 2 * np.arctan(np.r_[first, second])
+
+    def _joint_limit_candidates(self, local_target, joint_seed):
+        """Evaluate limit-boundary events for all eight discrete branches."""
+        angles, branches = [], []
+        for elbow in (1, -1):
+            prepared = self._prepare_ik(local_target, elbow)
+            if prepared is None:
+                continue
+            psi = self._joint_limit_arm_angles(prepared)
+            for branch in range(8):
+                if (-1 if branch & 2 else 1) == elbow:
+                    angles.extend(psi)
+                    branches.extend([branch] * len(psi))
+        return self._configuration_candidates(
+            local_target,
+            np.asarray(angles),
+            np.asarray(branches, dtype=int),
+            joint_seed,
+        )
+
+    def _joint_limit_anchor(self, target, seed):
+        """Try box anchors when the arm-angle parameterization is degenerate."""
+        lower, upper = self.qpos_limits_np.T
+        for joints in (0.5 * lower + 0.5 * upper, np.clip(seed, lower, upper)):
+            joints = joints.astype(np.float32)
+            if self._valid_poses(joints, target):
+                return joints.copy()
+        return None
+
     def get_ik(
         self,
         target_xpos,
@@ -748,6 +870,7 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
         search_mode="continuous",
         **kwargs,
     ):
+        self._refresh_weights()
         count = target_xpos.shape[0]
         seeds = (
             np.zeros((count, 7))
@@ -760,6 +883,7 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
         success = np.zeros(count, dtype=bool)
         for row, (target, seed) in enumerate(zip(targets, seeds)):
             mapped, valid = self._map_to_limits(seed, seed)
+            mapped = mapped.astype(np.float32)
             if (
                 not return_all_solutions
                 and valid
@@ -770,6 +894,10 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
             local_target = self._local_target(target)
             geometry = {1: self._prepare_ik(local_target, 1)}
             if geometry[1] is None:
+                if search_mode != "global" and not return_all_solutions:
+                    anchor = self._joint_limit_anchor(target, seed)
+                    if anchor is not None:
+                        output[row, 0], success[row] = anchor, True
                 continue
 
             def prepare(branch):
@@ -794,7 +922,7 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
                     ok, joints = self._get_each_ik(
                         target, psi, self.configs[branch], seed, prepare(branch)
                     )
-                    if ok and self._valid_poses(joints, target):
+                    if ok and self._valid_poses(joints.astype(np.float32), target):
                         output[row, 0], success[row] = joints, True
                         continue
                     offsets = np.array([0, -1, 1, -2, 2, -3, 3, -4, 4]) * np.deg2rad(5)
@@ -817,7 +945,7 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
                             * self.rotation_directions_np
                         )
                         candidates, valid = self._map_to_limits(candidates, seed)
-                        candidates = candidates[valid]
+                        candidates = candidates[valid].astype(np.float32)
                         valid = self._valid_poses(candidates, target)
                         if np.any(valid):
                             output[row, 0], success[row] = candidates[valid][0], True
@@ -826,25 +954,42 @@ class _CPUSRSSolverImpl(_BaseSRSSolverImpl):
                         continue
                 except (ValueError, FloatingPointError):
                     pass
-            branches = np.repeat(np.arange(8), len(self.elbow_angles))
-            valid, joints = self._configuration_candidates(
-                local_target, np.tile(self.elbow_angles, 8), branches, seed
-            )
-            candidates = joints[valid]
-            if self.cfg.sort_ik:
-                distances = np.linalg.norm(
-                    (candidates - seed) * self._distance_weights, axis=-1
-                )
-                candidates = candidates[np.argsort(distances, kind="stable")]
-            if return_all_solutions:
-                candidates = candidates[self._valid_poses(candidates, target)]
-                output[row, : len(candidates)] = candidates
-                success[row] = len(candidates) > 0
-            else:
-                for joints in candidates:
-                    if self._valid_poses(joints, target):
-                        output[row, 0], success[row] = joints, True
-                        break
+            searches = ("interval",) if search_mode == "interval" else ("global",)
+            if search_mode == "continuous" and not return_all_solutions:
+                searches += ("interval",)
+            for search in searches:
+                if search == "interval":
+                    valid, joints = self._joint_limit_candidates(local_target, seed)
+                else:
+                    branches = np.repeat(np.arange(8), len(self.elbow_angles))
+                    valid, joints = self._configuration_candidates(
+                        local_target, np.tile(self.elbow_angles, 8), branches, seed
+                    )
+                candidates = joints[valid].astype(np.float32)
+                if self.cfg.sort_ik:
+                    distances = np.linalg.norm(
+                        (candidates - seed) * self._distance_weights, axis=-1
+                    )
+                    candidates = candidates[np.argsort(distances, kind="stable")]
+                if return_all_solutions:
+                    candidates = candidates[self._valid_poses(candidates, target)]
+                    output[row, : len(candidates)] = candidates
+                    success[row] = len(candidates) > 0
+                else:
+                    for joints in candidates:
+                        if self._valid_poses(joints, target):
+                            output[row, 0], success[row] = joints, True
+                            break
+                if success[row]:
+                    break
+            if (
+                not success[row]
+                and search_mode != "global"
+                and not return_all_solutions
+            ):
+                anchor = self._joint_limit_anchor(target, seed)
+                if anchor is not None:
+                    output[row, 0], success[row] = anchor, True
         return _as_tensor(success, device=self.device), _as_tensor(
             output, device=self.device
         )
@@ -914,16 +1059,8 @@ class _WarpSRSSolverImpl(_BaseSRSSolverImpl):
         weights = np.asarray(self.cfg.ik_nearest_weight, dtype=float)
         if np.array_equal(weights, self._weight_values):
             return
-        if (
-            weights.shape != (7,)
-            or not np.all(np.isfinite(weights))
-            or np.any(weights < 0)
-        ):
-            raise ValueError(
-                "ik_nearest_weight must be seven finite non-negative values"
-            )
+        super()._refresh_weights()
         self._weight_values = weights.copy()
-        self.ik_nearst_weight = weights
         # Singular shoulder/wrist pairs need only their local weight ratio.
         # Normalize each pair independently so other joints cannot erase it.
         singular_weights = np.zeros(7)
@@ -1242,11 +1379,13 @@ class SRSSolver:
             [configuration.shoulder, configuration.elbow, configuration.wrist],
             dtype=np.float64,
         )
+        self._geometry_impl._refresh_weights()
         success, joints = self._geometry_impl._get_each_ik(
             target, configuration.redundancy, branch, seed
         )
         if not success:
             return False, None
+        joints = joints.astype(np.float32)
         actual = self._geometry_impl._get_fk(joints)
         if not np.allclose(actual, target, atol=1e-4, rtol=0.0):
             return False, None
@@ -1286,6 +1425,7 @@ class SRSSolver:
         configurations = tuple(configurations)
         if any(not isinstance(c, SRSConfiguration) for c in configurations):
             raise TypeError("configurations must contain SRSConfiguration values")
+        self._geometry_impl._refresh_weights()
         if not configurations:
             output = np.zeros((0, 7))
             success = np.zeros(0, dtype=bool)
@@ -1304,6 +1444,7 @@ class SRSSolver:
             success, output = impl._configuration_candidates(
                 local, angles, branches, seed
             )
+            output = output.astype(np.float32)
             rows = np.flatnonzero(success)
             if len(rows):
                 actual = impl._get_fk(output[rows])
@@ -1552,19 +1693,25 @@ class SRSSolver:
         )
         if kwargs:
             raise TypeError(f"Unexpected IK arguments: {', '.join(sorted(kwargs))}")
-        if search_mode not in ("continuous", "global"):
-            raise ValueError("search_mode must be 'continuous' or 'global'")
-        if self.use_warp and search_mode != "global":
+        if search_mode not in ("continuous", "global", "interval"):
+            raise ValueError("search_mode must be 'continuous', 'global' or 'interval'")
+        if search_mode == "interval" and return_all_solutions:
+            raise ValueError("interval search returns one solution per target")
+        if self.use_warp and search_mode == "continuous":
             raise ValueError(
-                "Warp batch IK supports search_mode='global'; continuous mode uses the NumPy backend"
+                "continuous search requires use_warp=False; choose global for native "
+                "Warp or interval for CPU boundary search"
             )
-        target_xpos = _as_tensor(target_xpos, dtype=torch.float32, device=self.device)
+        interval_search = search_mode == "interval"
+        input_device = torch.device("cpu") if interval_search else self.device
+        input_dtype = torch.float64 if interval_search else torch.float32
+        target_xpos = _as_tensor(target_xpos, dtype=input_dtype, device=input_device)
         if target_xpos.ndim == 2:
             target_xpos = target_xpos.unsqueeze(0)
         if target_xpos.ndim != 3 or target_xpos.shape[1:] != (4, 4):
             raise ValueError("target_xpos must have shape (4, 4) or (N, 4, 4)")
         if qpos_seed is not None:
-            qpos_seed = _as_tensor(qpos_seed, dtype=torch.float32, device=self.device)
+            qpos_seed = _as_tensor(qpos_seed, dtype=input_dtype, device=input_device)
             if qpos_seed.ndim == 1:
                 qpos_seed = qpos_seed.unsqueeze(0)
             if qpos_seed.shape != (target_xpos.shape[0], 7):
@@ -1573,11 +1720,20 @@ class SRSSolver:
         target_xpos = target_xpos.contiguous()
         if target_xpos.shape[0] == 0:
             slots = 8 * self.cfg.num_samples if return_all_solutions else 1
-            return torch.empty(
-                0, dtype=torch.bool, device=self.device
-            ), target_xpos.new_empty((0, slots, 7))
+            return torch.empty(0, dtype=torch.bool, device=self.device), torch.empty(
+                (0, slots, 7), dtype=torch.float32, device=self.device
+            )
         with _torch_stream(self.device):
-            self.impl._validate_inputs(target_xpos, qpos_seed)
+            impl = self._geometry_impl if interval_search else self.impl
+            impl._validate_inputs(target_xpos, qpos_seed)
+            if interval_search:
+                # Boundary-event search uses scalar float64 CPU geometry, just
+                # like exact configuration queries. Native global batching is
+                # unchanged; this explicit mode favors narrow-limit reliability.
+                success, joints = self._geometry_impl.get_ik(
+                    target_xpos, qpos_seed, search_mode=search_mode
+                )
+                return success.to(self.device), joints.to(self.device)
             return self.impl.get_ik(
                 target_xpos=target_xpos.contiguous(),
                 qpos_seed=qpos_seed,

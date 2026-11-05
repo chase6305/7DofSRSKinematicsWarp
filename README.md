@@ -78,6 +78,6 @@ srs-parallel-demo --device cuda --batch-size 4096 --num-samples 73
   avoidance](https://doi.org/10.1016/j.mechmachtheory.2017.10.025).
   *Mechanism and Machine Theory*, 121, 317–334.
 
-The implementation follows the arm-angle formulation, with sampled arm-angle
-search rather than complete analytical feasible-interval construction.
+The arm-angle core supports sampled and joint-boundary search. The papers’
+redundancy/avoidance policies and experiments are not fully reproduced.
 See [implementation differences](docs/paper-comparison.md).

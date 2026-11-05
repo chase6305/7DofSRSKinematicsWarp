@@ -14,6 +14,45 @@ BACKENDS = [(False, "cpu"), (True, "cpu")] + (
 
 
 @pytest.mark.parametrize("use_warp,device", BACKENDS)
+@pytest.mark.parametrize("query", ["scalar", "batch", "interval"])
+def test_fk_validation_uses_returned_float32_joints(use_warp, device, query):
+    solver = SRSSolver(SRSSolverCfg(num_samples=17), 1, device, use_warp=use_warp)
+    nominal = np.array([0.3, -0.5, 0.7, 1.0, -0.4, 0.8, -0.2])
+
+    def solve(q):
+        target = solver._geometry_impl._get_fk(q)
+        config = solver.get_configuration(q)
+        if query == "scalar":
+            ok, joints = solver.solve_configuration(target, config, q)
+            if not ok:
+                assert joints is None
+                return False
+        elif query == "batch":
+            ok, joints = solver.solve_configurations(target, [config], q)
+            if not bool(ok[0]):
+                assert not bool(joints.any())
+                return False
+            joints = joints[0]
+        else:
+            ok, joints = solver.get_ik(target, q, search_mode="interval")
+            if not bool(ok[0]):
+                assert not bool(joints.any())
+                return False
+            joints = joints[0, 0]
+        actual = solver._geometry_impl._get_fk(joints.cpu().numpy())
+        np.testing.assert_allclose(actual, target, atol=1e-4, rtol=0)
+        return True
+
+    shifted = nominal + 2 * np.pi * 100000
+    solver.set_position_limits(shifted - 0.1, shifted + 0.1)
+    # A float64 solution can lose centimetres of accuracy when stored as
+    # float32 at this magnitude. Success must describe the returned tensor.
+    solve(shifted)
+    solver.set_position_limits(nominal - 0.1, nominal + 0.1)
+    assert solve(nominal)
+
+
+@pytest.mark.parametrize("use_warp,device", BACKENDS)
 @pytest.mark.parametrize(
     "middle,value", [(None, 0), (1, 0), (5, 0), (1, np.pi), (5, np.pi)]
 )

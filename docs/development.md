@@ -29,6 +29,13 @@ miss feasible intervals. The exact branch/arm-angle API uses CPU geometry even
 when the selected device is CUDA; see [API contracts](api.md) for shapes and
 scalar conventions.
 
+Explicit `interval` search uses float64 CPU geometry to check analytical
+joint-limit boundaries and cell midpoints. It preserves CPU input precision
+and avoids native kernel launches; only the result moves to the selected
+device. Boundary events reuse up to two geometry/limit-specific arrays, while
+seeds, weights and FK residual checks remain live. NumPy continuous mode uses
+this search only after its local and uniform queries fail.
+
 FK checks finite inputs in its existing launch. Its seven-joint chain retains
 intermediates for Warp Tape gradients. Null-space velocity uses a full SVD to
 preserve extra null directions at singular poses. Modern Warp versions compile
@@ -59,7 +66,7 @@ Recorded local comparisons on RTX 5090 D v2, Python 3.10, Torch 2.13.0+cu130,
 Warp 1.16.0 and NumPy 2.2.6:
 
 | Workload | Baseline | Optimized |
-|:--|--:|--:|
+| :-- | --: | --: |
 | Global IK, 64 CUDA targets | 0.594 ms | 0.245 ms |
 | Global IK, 4096 CUDA targets | 0.962 ms | 0.480 ms |
 | Constructor + first FK, CUDA | 20.371 s | 2.231 s |

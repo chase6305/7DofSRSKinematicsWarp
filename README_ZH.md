@@ -78,5 +78,5 @@ srs-parallel-demo --device cuda --batch-size 4096 --num-samples 73
   avoidance](https://doi.org/10.1016/j.mechmachtheory.2017.10.025).
   *Mechanism and Machine Theory*, 121, 317–334.
 
-本实现采用论文的臂角参数化思路，臂角选择使用有限采样，并未完整实现解析可行区间构造。
+本实现支持臂角采样与关节限位边界搜索，尚未完整复现论文的冗余选择、奇异性规避及实验。
 详见 [实现差异](docs/paper-comparison.md)。
